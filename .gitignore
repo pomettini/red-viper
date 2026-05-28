@@ -3,6 +3,14 @@ build
 .vscode
 .claude/
 .codex/
+
+# Playdate port build artifacts
+playdate/build/
+playdate/*.pdx/
+playdate/Source/pdex.bin
+playdate/Source/pdex.dylib
+playdate/Source/pdex.so
+playdate/Source/pdex.dll
 *.3dsx
 *.cia
 *.elf
