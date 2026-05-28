@@ -418,3 +418,160 @@ Also unresolved / to investigate:
 - **Next step:** test input — confirm A / A+B (Start) / D-pad reach
   the game by watching `PC` change. Then run on **real Playdate
   hardware** and capture the first device-side ms/frame number.
+
+### 2026-05-28 — FIRST REAL HARDWARE NUMBERS (the data the project exists for)
+
+Side-loaded `RedViper.pdx` to the device (`pdutil <port> datadisk`, copy to
+`/Games/`, eject, `pdutil <port> run /Games/RedViper.pdx`). Telemetry moved
+off-screen to `logToConsole`, batched one line per 20 frames so logging
+doesn't perturb the measurement. Captured on the Wario Land precaution
+screen (the game's boot busywait — see caveat below).
+
+**Initial device numbers (interpreter + naive blit):**
+```
+int=113 ms   vip=14 ms   blit=121 ms   tot=246 ms   (~4 fps)
+```
+- `int` (interpreter, V810 emulation): ~113 ms. Matches Beetle VB's
+  pre-JIT interpreter (87–127 ms) almost exactly. Same CPU, same ROM,
+  same SDRAM-stall problem.
+- `blit` (my 2bpp→1bpp framebuffer convert): **121 ms — bigger than the
+  interpreter.** Cause: the VB framebuffer is column-major (consecutive
+  rows are 64 bytes apart), and the first blit scanned by output row, so
+  every one of ~86k pixel reads missed cache and hit SDRAM.
+
+**Fix #1 — column-major blit.** Rewrote `pd_video_blit` to iterate by VB
+column (64 contiguous bytes = ~2 cache lines, reused for all reads in that
+column) and scatter into the Playdate framebuffer (which lives in fast
+cached RAM). Cache misses dropped from ~86k to ~768.
+```
+blit: 121 ms -> 1.2 ms     (~100x)
+```
+New total ~128 ms (~7.8 fps). **Render path is now solved**: vip+blit
+together ≈ 15 ms, well inside any frame budget. Lesson reinforced from the
+Beetle VB postmortem: on this hardware, memory *access pattern* dominates;
+the same loop reordered is 100x faster with zero algorithmic change.
+
+**Post-fix breakdown — the interpreter is now 88% of the frame:**
+```
+int=114 ms   vip=14 ms   blit=1.2 ms   tot=128 ms
+```
+~400000 emulated VB cycles/frame in ~114 ms ⇒ ~3.5 MHz effective vs the
+VB's 20 MHz ⇒ we are ~5.7x too slow on CPU alone. To hit the 20 fps / 50 ms
+"playable" target with ~15 ms of render, the interpreter must drop to
+~35 ms (~3.2x speedup). To hit native 50 Hz it needs ~5.7x.
+
+**Important caveat about this measurement point:** `PC` is pinned at
+`0xFFFC2326`/`0xFFFC232A` — a 4-byte busywait loop. Wario Land spins the
+CPU for the entire frame on the precaution screen. red-viper's *DRC* has
+busywait detection that collapses these idle spins; the *interpreter*
+(all we have on Playdate, DRC disabled) brute-forces every cycle. So this
+is close to a worst case for idle screens, and NOT representative of
+gameplay. The real benchmark must be captured in demo/gameplay mode.
+
+**Fix #2 (in flight) — interpreter ROM-fetch fast path.** `interpreter.c`
+fetched every instruction via `mem_rhword()`, which is in another TU (no
+inlining), returns a `uint64_t` with wait-state bits packed in the high
+word, and dispatches through a memory-region switch. Added a static-inline
+`itrp_fetch()` that, when PC is in the ROM region (the overwhelming common
+case), reads the 16-bit instruction straight from the ROM buffer and skips
+the call / switch / wait-state math / uint64 packing. Falls back to
+`mem_rhword` otherwise. Behaviour-identical (interpreter times from
+`opcycle[]`, not the discarded wait bits). Inert on the 3DS+DRC build (the
+interpreter never runs with PC in ROM there). Device measurement pending.
+
+**Decision framing for the dynarec question:** the render path is no longer
+a concern. The interpreter is the whole game now. Options, cheapest first:
+1. Interpreter micro-opt (fetch fast path = fix #2; possibly decode-cache,
+   busywait detection in the interpreter). Low effort, bounded upside —
+   Beetle VB's interpreter tuning only bought ~15%.
+2. Busywait detection ported from the DRC into the interpreter. Helps idle
+   screens hugely, helps gameplay where the game waits on VIP/timer.
+3. Thumb-2 dynarec backend (rewrite of `arm_emit`/`arm_codegen`/`drc_exec`
+   for Cortex-M7). The real fix per the postmortem; multi-week effort.
+Plan: exhaust cheap interpreter wins and measure each on-device before
+committing to (3), so we know how much the dynarec actually has to buy.
+
+**Fix #2 measured on device:** interpreter ROM-fetch fast path took the
+interpreter from ~114 ms to ~83 ms (−27%) on the precaution screen — more
+than Beetle VB's entire interpreter-tuning effort (~15%) from one change.
+Total ~98 ms (~10 fps). Still measuring the busywait screen, so this is the
+idle-loop figure, not gameplay.
+
+### 2026-05-28 — Fix #3: busywait detection in the interpreter (built, measurement pending)
+
+Ported the DRC's busywait concept into `interpreter.c`:
+- `busywait_body_ok(target, branch)` walks the loop body and returns true
+  only if every instruction is idempotent — loads (except pointer-chase
+  `reg1==reg2`), MOV/MOVEA/MOVHI, AND/ANDI, CMP/CMP_I, `or rX,rX`,
+  `add r0,rX`. Everything else (stores, ADD_I/SUB counters, jumps, nested
+  branches) returns false. This is the same whitelist as
+  `drc_findLastConditionalInst`, and it deliberately excludes counting
+  loops (`add -1,rX; bne`) which must not be skipped.
+- Verdicts cached per branch PC in a 256-entry direct-mapped table
+  (`bw_cache`). Only ROM branches are classified (ROM can't self-modify,
+  so a verdict is permanent).
+- In the branch-taken path: if the branch is backward (`disp <= 0`), in
+  ROM, and classified as a busywait, fast-forward exactly like the HALT
+  handler — set `cycles = target`, zero `cycles_until_event`, call
+  `serviceInt` in a loop until an interrupt moves PC or the frame ends,
+  then return. This collapses an idle spin (potentially the whole ~400k-cy
+  frame) into one event-advance step.
+- Inert on the 3DS+DRC build: there the interpreter never runs with PC in
+  ROM (the DRC owns ROM), so the `last_PC in ROM` gate is always false.
+
+Expected effect on the precaution screen: it IS a busywait, so `int` should
+drop dramatically (most of the 83 ms is the spin). The bigger question is
+gameplay, where busywait detection recovers the idle time games spend
+waiting on VIP/timer interrupts — exactly what makes the DRC fast on 3DS.
+
+Build is ready; device dropped off USB before this build could be pushed
+(serial port `/dev/cu.usbmodemPDU1_...` and the PLAYDATE disk both absent —
+device asleep/locked or cable). **Next: push fix #3, read `int` on the
+precaution screen, then get into gameplay (press A+B = Start, or wait) for
+the representative number that actually decides the dynarec question.**
+
+### 2026-05-28 — busywait measured + FIRST GAMEPLAY NUMBERS (decision-grade data)
+
+Pushed fix #3 and the user drove through menus -> main menu -> demo level 1
+-> demo level 2. This is the representative data the project needed.
+
+**Busywait detection — confirmed working:**
+- Precaution screen `int`: 83 ms -> ~20–32 ms. The spin is now fast-
+  forwarded to each event instead of brute-forced. Input also confirmed
+  working (PC walked through menu code and an interrupt vector at
+  `0xFFFFFE10`; A/B/D-pad reach the game).
+
+**Menus / simple scenes: PLAYABLE.**
+- `int≈20–26  vip≈6–7  tot≈28–33 ms` ⇒ ~30 fps. Genuinely smooth.
+
+**Demo gameplay — both costs balloon, and rendering is NOT solved:**
+- Demo L1: `int≈42  vip≈54  blit≈2  tot≈98 ms` (~10 fps). **The soft VIP
+  renderer (54 ms) is the BIGGER cost here — bigger than the interpreter.**
+  On the simple precaution screen vip was only 14 ms; a full BG + sprite
+  gameplay scene is ~4x heavier.
+- Demo L2: `int≈60–92  vip≈25–37  tot≈80–175 ms` (~6–10 fps), spikier.
+- Occasional `int` spikes to 120–147 ms on scene transitions (cold code /
+  new tile sets — the SDRAM working-set effect from the Beetle VB
+  postmortem, now visible in our interpreter too).
+
+**Revised understanding (important):** the earlier "render is solved"
+conclusion was an artefact of measuring a trivial screen. In real gameplay
+the interpreter and the software VIP renderer are *co-equal* costs, each
+~25–55 ms. Both must come down. Menus already are playable.
+
+**Fix #4 — single-eye soft renderer.** `video_soft.cpp` composited BOTH
+eyes (per-world loops ran `eye < 2`), but the Playdate display is 1-bit
+mono and the blit only reads the left eye — half the raster work was
+thrown away. Added `SOFT_EYE_COUNT` (1 on Playdate/Simulator, 2 on 3DS),
+applied to all four eye loops (clear, normal-world, affine, object).
+Expected ~2x on gameplay `vip` (~54 -> ~27 ms), demo L1 ~98 -> ~70 ms
+(~14 fps). 3DS stereo unchanged. Measurement pending next gameplay run.
+
+**Where the dynarec decision stands:** menus are already playable on the
+pure interpreter + busywait detection. Gameplay needs both renderer
+(single-eye now; more raster opt possible) and interpreter (40–90 ms,
+needs ~2x for 20 fps) to improve. The interpreter half ultimately points
+to a Thumb-2 dynarec — but the cheap wins already took us 246 ms -> ~30 ms
+on menus and ~70–100 ms in gameplay, so simpler / "less demanding" games
+look reachable on the interpreter alone. Decide after the single-eye
+gameplay number lands.

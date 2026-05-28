@@ -5,6 +5,24 @@
 #include "vb_types.h"
 #include "drc_core.h"
 
+// Fast-path instruction fetch. The generic mem_rhword() lives in another
+// translation unit (no cross-TU inlining without LTO), returns a uint64_t
+// with wait-state bits packed in the high word, and dispatches through a
+// region switch. For instruction fetch we only need the 16-bit value, and
+// the PC is overwhelmingly in ROM, so read straight from the ROM buffer and
+// fall back to mem_rhword for the rare non-ROM fetch (e.g. WRAM-resident
+// code). Behaviour is identical: the interpreter derives timing from the
+// opcycle[] table, not the discarded wait bits.
+//
+// On the 3DS+DRC build the interpreter never runs with PC in ROM (the DRC
+// owns that path and the interpreter loop exits when PC enters ROM), so this
+// fast path is inert there and only benefits the DRC-less Playdate build.
+static inline HWORD itrp_fetch(WORD PC) {
+    if ((PC & 0x07000000) == 0x07000000)
+        return *(HWORD *)(V810_ROM1.off + (PC & (0x07000000 | (MAX_ROM_SIZE - 1)) & ~1));
+    return (HWORD)mem_rhword(PC);
+}
+
 static bool get_cond(BYTE code, WORD psw) {
     bool cond = false;
     switch (0x40 | (code & ~8)) {
@@ -19,6 +37,71 @@ static bool get_cond(BYTE code, WORD psw) {
     }
     if (code & 8) cond = !cond;
     return cond;
+}
+
+// --- Busywait detection -----------------------------------------------------
+//
+// The DRC (source/arm/drc_core.c) gets its speed partly by recognising idle
+// spin loops and fast-forwarding to the next scheduled event instead of
+// executing the loop body millions of times. The DRC-less Playdate build
+// needs the same trick in the interpreter, or idle screens (and the idle
+// time within real gameplay) cost a full frame of brute-forced iterations.
+//
+// A backward branch whose loop body is *idempotent* — re-running it produces
+// identical register/memory state — cannot change its own exit condition
+// until an interrupt fires, so we can jump straight to the next event. The
+// whitelist below mirrors the DRC's drc_findLastConditionalInst(): loads,
+// moves, compares, `or rX,rX`, `add r0,rX`. Crucially it EXCLUDES counters
+// (ADD_I / SUB / etc.) and pointer-chasing loads (reg1==reg2), because
+// skipping those would corrupt state. Anything not whitelisted -> not a
+// busywait (conservative; we just don't optimise it).
+//
+// Verdicts are cached per branch PC. Only ROM branches are classified: ROM
+// can't self-modify, so a verdict stays valid for the life of the ROM.
+
+static bool busywait_body_ok(WORD target_pc, WORD branch_pc) {
+    WORD pc = target_pc;
+    while (pc < branch_pc) {
+        HWORD instr = itrp_fetch(pc);
+        BYTE opcode = instr >> 10;
+        BYTE reg1 = instr & 31;
+        BYTE reg2 = (instr >> 5) & 31;
+        pc += (opcode >= 0x28) ? 4 : 2;
+        switch (opcode) {
+            case V810_OP_LD_B: case V810_OP_LD_H: case V810_OP_LD_W:
+            case V810_OP_IN_B: case V810_OP_IN_H: case V810_OP_IN_W:
+                // a load into its own address register is a pointer chase,
+                // not idempotent
+                if (reg1 == reg2) return false;
+                break;
+            case V810_OP_MOV:  case V810_OP_MOV_I:
+            case V810_OP_MOVEA: case V810_OP_MOVHI:
+            case V810_OP_AND:  case V810_OP_ANDI:
+            case V810_OP_CMP:  case V810_OP_CMP_I:
+                break;
+            case V810_OP_OR:
+                if (reg1 != reg2) return false; // only `or rX,rX` is a no-op
+                break;
+            case V810_OP_ADD:
+                if (reg1 != 0) return false;    // only `add r0,rX` is a no-op
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+#define BW_CACHE_SIZE 256
+static struct { WORD branch_pc; bool busy; } bw_cache[BW_CACHE_SIZE];
+
+static inline bool is_busywait_loop(WORD target_pc, WORD branch_pc) {
+    unsigned idx = (branch_pc >> 1) & (BW_CACHE_SIZE - 1);
+    if (bw_cache[idx].branch_pc == branch_pc) return bw_cache[idx].busy;
+    bool b = busywait_body_ok(target_pc, branch_pc);
+    bw_cache[idx].branch_pc = branch_pc;
+    bw_cache[idx].busy = b;
+    return b;
 }
 
 int interpreter_run(void) {
@@ -40,7 +123,7 @@ int interpreter_run(void) {
             }
             target = cycles + vb_state->v810_state.cycles_until_event_partial;
         }
-        HWORD instr = mem_rhword(PC);
+        HWORD instr = itrp_fetch(PC);
         PC += 2;
         BYTE opcode = instr >> 10;
         BYTE reg1 = instr & 31;
@@ -315,13 +398,34 @@ int interpreter_run(void) {
             if (get_cond(instr >> 9, vb_state->v810_state.S_REG[PSW])) {
                 SHWORD disp = instr & (1 << 8) ? (instr | 0xfe00) : (instr & ~0xfe00);
                 PC += disp - 2;
+                // Busywait: a taken backward branch in ROM whose loop body is
+                // idempotent can't change its own exit condition until an
+                // interrupt fires. Fast-forward to the next event instead of
+                // spinning (mirrors the DRC and the HALT handler below).
+                // last_PC holds the branch instruction's own address; PC now
+                // holds the branch target.
+                if (disp <= 0
+                    && (last_PC & 0x07000000) == 0x07000000
+                    && is_busywait_loop(PC, last_PC)) {
+                    cycles = target;
+                    vb_state->v810_state.PC = PC;
+                    do {
+                        cycles += vb_state->v810_state.cycles_until_event_partial;
+                        vb_state->v810_state.cycles_until_event_partial = vb_state->v810_state.cycles_until_event_full = 0;
+                        vb_state->v810_state.cycles = cycles;
+                        serviceInt(cycles, PC);
+                    } while (!vb_state->v810_state.ret && vb_state->v810_state.PC == PC);
+                    // PC is either the (unchanged) loop target or an interrupt
+                    // vector; vb_state already holds it. Return like HALT.
+                    return 0;
+                }
             } else {
                 // branch not taken, so it only took 1 cycle
                 cycles -= 2;
             }
         } else {
             // long instr
-            HWORD instr2 = mem_rhword(PC);
+            HWORD instr2 = itrp_fetch(PC);
             PC += 2;
             switch (opcode) {
                 case V810_OP_MOVEA: {

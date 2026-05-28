@@ -58,52 +58,113 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
     return 0;
 }
 
+// Per-window profile accumulators. One window = LOG_INTERVAL frames; at the
+// end of each window we emit one console line summarising avg/max costs.
+// Stays out of the hot path: just integer/float adds, one snprintf+log per
+// window. logToConsole sent at ~1 Hz; even if it blocks briefly, only one
+// frame per second pays for it.
+#define LOG_INTERVAL 20
+
+// Render frame skip. RENDER_SKIP=0 renders every Playdate frame; =1 renders
+// every other; =2 every third; etc. The interpreter still runs every frame
+// so VB game timing stays correct; only the visible refresh slows.
+#define RENDER_SKIP 0
+
+static struct {
+    int     count;
+    float   total_sum,  total_max;
+    float   interp_sum;
+    float   vip_sum,    vip_max;
+    float   blit_sum;
+    int     rendered_frames;
+} s_prof;
+
+static void prof_reset(void) {
+    s_prof.count = 0;
+    s_prof.total_sum = 0.0f; s_prof.total_max = 0.0f;
+    s_prof.interp_sum = 0.0f;
+    s_prof.vip_sum = 0.0f;   s_prof.vip_max = 0.0f;
+    s_prof.blit_sum = 0.0f;
+    s_prof.rendered_frames = 0;
+}
+
 static int update(void* userdata)
 {
     PlaydateAPI* pd = (PlaydateAPI*)userdata;
     const pd_core_status* st = pd_core_get_status();
 
-    pd_core_run_frame(pd);
-
-    if (st->loaded) {
-        // Paints VB output across the whole framebuffer (black borders).
-        pd_video_render_frame(pd);
-        // Mark all rows; drawText below extends past the VB region's bounds.
-        pd->graphics->markUpdatedRows(0, 239);
-    } else {
-        pd->graphics->clear(kColorWhite);
-    }
-
-    if (s_font) pd->graphics->setFont(s_font);
-
-    char line[96];
-
     if (s_load_err) {
+        // One-shot draw of the error and stop running the loop body. No
+        // further compute, no further logging.
+        pd->graphics->clear(kColorWhite);
+        if (s_font) pd->graphics->setFont(s_font);
+        char line[96];
         snprintf(line, sizeof(line), "ROM error: %s", s_load_err);
         pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 40);
         snprintf(line, sizeof(line), "path: %s", ROM_PATH);
         pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 64);
-    } else if (!st->loaded) {
-        snprintf(line, sizeof(line), "loading...");
-        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 40);
-    } else {
-        // Telemetry over (likely black) VB output: draw text white-on-
-        // transparent. Top line sits below the FPS overlay (~16 px tall).
-        pd->graphics->setDrawMode(kDrawModeFillWhite);
-        snprintf(line, sizeof(line), "%.1fms %luc f=%lu r=%d",
-                 (double)st->last_frame_ms,
-                 (unsigned long)st->last_frame_cycles,
-                 (unsigned long)st->frames_run,
-                 st->last_run_ret);
-        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 2, 22);
-        snprintf(line, sizeof(line), "PC=%08lx XP=%04x IP=%04x",
-                 (unsigned long)st->pc,
-                 st->xpctrl,
-                 st->intpnd);
-        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 2, 220);
-        pd->graphics->setDrawMode(kDrawModeCopy);
+        return 1;
     }
 
-    pd->system->drawFPS(0, 0);
+    if (!st->loaded) return 1;
+
+    static int s_skip_counter = 0;
+    bool do_render = (s_skip_counter == 0);
+    s_skip_counter = (s_skip_counter + 1) % (RENDER_SKIP + 1);
+
+    unsigned int t_start = pd->system->getCurrentTimeMilliseconds();
+
+    pd_core_run_frame(pd);
+    float interp_ms = st->last_frame_ms;
+
+    float vip_ms = 0.0f;
+    float blit_ms = 0.0f;
+    if (do_render) {
+        unsigned int t_pre_vip = pd->system->getCurrentTimeMilliseconds();
+        pd_video_vip_step(pd);
+        unsigned int t_post_vip = pd->system->getCurrentTimeMilliseconds();
+        pd_video_blit(pd);
+        unsigned int t_post_blit = pd->system->getCurrentTimeMilliseconds();
+        vip_ms  = (float)(t_post_vip  - t_pre_vip);
+        blit_ms = (float)(t_post_blit - t_post_vip);
+        s_prof.rendered_frames++;
+    }
+
+    unsigned int t_end = pd->system->getCurrentTimeMilliseconds();
+    float total_ms = (float)(t_end - t_start);
+
+    s_prof.count++;
+    s_prof.total_sum  += total_ms;
+    s_prof.interp_sum += interp_ms;
+    s_prof.vip_sum    += vip_ms;
+    s_prof.blit_sum   += blit_ms;
+    if (total_ms > s_prof.total_max) s_prof.total_max = total_ms;
+    if (vip_ms   > s_prof.vip_max)   s_prof.vip_max   = vip_ms;
+
+    if (s_prof.count >= LOG_INTERVAL) {
+        // Average over the whole window for interp+total (every frame), but
+        // only over rendered frames for vip/blit (so the per-render cost is
+        // visible even when RENDER_SKIP > 0).
+        float inv_all = 1.0f / (float)s_prof.count;
+        float inv_ren = s_prof.rendered_frames > 0
+                      ? 1.0f / (float)s_prof.rendered_frames
+                      : 0.0f;
+        pd->system->logToConsole(
+            "f=%lu int=%.1f vip=%.1f blit=%.1f tot=%.1f (max tot=%.1f vip=%.1f) "
+            "rendered=%d/%d cy=%lu PC=%08lx XP=%04x",
+            (unsigned long)st->frames_run,
+            (double)(s_prof.interp_sum * inv_all),
+            (double)(s_prof.vip_sum    * inv_ren),
+            (double)(s_prof.blit_sum   * inv_ren),
+            (double)(s_prof.total_sum  * inv_all),
+            (double)s_prof.total_max,
+            (double)s_prof.vip_max,
+            s_prof.rendered_frames, s_prof.count,
+            (unsigned long)st->last_frame_cycles,
+            (unsigned long)st->pc,
+            st->xpctrl);
+        prof_reset();
+    }
+
     return 1;
 }

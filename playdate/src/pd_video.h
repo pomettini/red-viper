@@ -3,8 +3,16 @@
 
 #include "pd_api.h"
 
-// Composite + blit one VB frame into the Playdate framebuffer.
-// Safe to call when no ROM is loaded (no-op).
-void pd_video_render_frame(PlaydateAPI *pd);
+// Split into two functions so the caller can time them independently.
+//
+// pd_video_vip_step:   runs the Red Viper software VIP renderer
+//                      (update_texture_cache_soft + video_soft_render).
+//                      Writes a 384x224 2bpp framebuffer into V810_DISPLAY_RAM.
+// pd_video_blit:       reads that framebuffer, threshold-converts to 1bpp,
+//                      blits centered into the Playdate display.
+//
+// Both are safe no-ops if vb_state is NULL.
+void pd_video_vip_step(PlaydateAPI *pd);
+void pd_video_blit(PlaydateAPI *pd);
 
 #endif

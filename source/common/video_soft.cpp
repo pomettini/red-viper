@@ -1,6 +1,15 @@
 #include "vb_dsp.h"
 #include "v810_mem.h"
 
+// The Playdate display is 1-bit mono — there is no stereo output, so the
+// right eye is composited and then thrown away by the blit. Render only the
+// left eye (eye 0) there. The 3DS keeps full stereo.
+#if defined(TARGET_PLAYDATE) || defined(TARGET_SIMULATOR)
+#define SOFT_EYE_COUNT 1
+#else
+#define SOFT_EYE_COUNT 2
+#endif
+
 static struct {
     // half-nibbles are colour indices
     union {
@@ -221,7 +230,7 @@ template<bool over> void render_affine_world(WORLD *world, int drawn_fb) {
 
     u8 *gplt = vb_state->tVIPREG.GPLT;
 
-    for (int eye = 0; eye < 2; eye++) {
+    for (int eye = 0; eye < SOFT_EYE_COUNT; eye++) {
         if (!(world->head & (0x8000 >> eye)))
             continue;
 
@@ -302,7 +311,7 @@ void video_soft_render(int drawn_fb) {
     memset(out_fb, 0, fb_size);
     #endif
 	    uint8_t object_group_id = 3;
-    for (int eye = 0; eye < 2; eye++) {
+    for (int eye = 0; eye < SOFT_EYE_COUNT; eye++) {
         uint16_t *fb = (uint16_t*)(vb_state->V810_DISPLAY_RAM.off + 0x10000 * eye + 0x8000 * drawn_fb);
         memset(fb, 0, 0x6000);
     }
@@ -344,7 +353,7 @@ void video_soft_render(int drawn_fb) {
         
         if (worlds[wrld].bgm == 0) {
             // normal world
-            for (int eye = 0; eye < 2; eye++) {
+            for (int eye = 0; eye < SOFT_EYE_COUNT; eye++) {
                 if (!(worlds[wrld].on & (2 >> eye)))
                     continue;
                 uint16_t *fb = (uint16_t*)(vb_state->V810_DISPLAY_RAM.off + 0x10000 * eye + 0x8000 * drawn_fb);
@@ -407,7 +416,7 @@ void video_soft_render(int drawn_fb) {
                     if (column->max < max) column->max = max;
                 }
 
-                for (int eye = 0; eye < 2; eye++) {
+                for (int eye = 0; eye < SOFT_EYE_COUNT; eye++) {
                     if (!(cw1 & (0x8000 >> eye)))
                         continue;
 

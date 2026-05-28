@@ -45,12 +45,10 @@ extern void video_soft_render(int drawn_fb);
 #define MARGIN_Y        ((PD_H - VB_H) / 2)   // 8
 #define THRESHOLD       2     // VB value >= threshold => Playdate white
 
-void pd_video_render_frame(PlaydateAPI *pd) {
+void pd_video_vip_step(PlaydateAPI *pd) {
+    (void)pd;
     if (!vb_state) return;
 
-    // Decide which framebuffer the soft renderer should write to. The VB
-    // double-buffer ping-pongs on every frame end; for single-buffer games
-    // (most of them, including Wario Land) we just always use FB 0.
     int displayed_fb = vb_state->tVIPREG.tDisplayedFB & 1;
     int drawn_fb = tVBOpt.DOUBLE_BUFFER ? displayed_fb : 0;
 
@@ -67,8 +65,13 @@ void pd_video_render_frame(PlaydateAPI *pd) {
         memset(tDSPCACHE.BGCacheInvalid, 0, sizeof(tDSPCACHE.BGCacheInvalid));
         memset(tDSPCACHE.CharacterCache, 0, sizeof(tDSPCACHE.CharacterCache));
     }
+}
 
-    // Pull the left-eye, "currently displayed" framebuffer pointer.
+void pd_video_blit(PlaydateAPI *pd) {
+    if (!vb_state) return;
+
+    int displayed_fb = vb_state->tVIPREG.tDisplayedFB & 1;
+    int drawn_fb = tVBOpt.DOUBLE_BUFFER ? displayed_fb : 0;
     int read_fb = tVBOpt.DOUBLE_BUFFER ? displayed_fb : drawn_fb;
     const uint8_t *vbfb =
         (const uint8_t *)(vb_state->V810_DISPLAY_RAM.off + 0x8000 * read_fb);
@@ -76,37 +79,31 @@ void pd_video_render_frame(PlaydateAPI *pd) {
     uint8_t *pdfb = pd->graphics->getFrame();
     if (!pdfb) return;
 
-    // Clear all rows to black, then paint the VB region. Borders stay black.
+    // Clear all rows to black; we only OR in the VB-bright pixels.
     memset(pdfb, 0x00, PD_H * PD_STRIDE);
 
-    // Per Playdate row, walk the VB columns 8 at a time, packing into one
-    // output byte. VB column c stride is 64 bytes; the byte we want for VB
-    // row vby is at (c * 64 + (vby >> 2)), with two bits at shift
-    // ((vby & 3) << 1).
-    for (int py = MARGIN_Y; py < MARGIN_Y + VB_H; py++) {
-        int vby = py - MARGIN_Y;
-        int byte_in_col = vby >> 2;
-        int shift = (vby & 3) << 1;
-        uint8_t *row = pdfb + py * PD_STRIDE;
+    // Iterate by VB column, not by Playdate row, so the SDRAM reads are
+    // sequential within each 64-byte VB column. Each column lives in two
+    // 32-byte cache lines, so ~2 cache misses per column instead of one
+    // miss per pixel — drops total misses from ~86k to ~768.
+    //
+    // Each VB byte holds 4 consecutive rows of one column, so one read
+    // produces four scattered writes into the Playdate framebuffer.
+    // Playdate FB sits in fast (cached) RAM so the scatter is cheap.
+    for (int vbc = 0; vbc < VB_W; vbc++) {
+        const uint8_t *col = vbfb + vbc * 64;
+        int px = vbc + MARGIN_X;
+        int pdb_off = px >> 3;
+        uint8_t pdmask = (uint8_t)(0x80 >> (px & 7));
 
-        // Output bytes covering Playdate columns [MARGIN_X .. MARGIN_X+VB_W).
-        // Compute the first and last whole bytes; handle leading/trailing
-        // partial bytes separately. With MARGIN_X = 8, both edges fall on
-        // byte boundaries, so just iterate per byte.
-        for (int pbyte = MARGIN_X >> 3; pbyte < (MARGIN_X + VB_W) >> 3; pbyte++) {
-            int vbc_base = (pbyte << 3) - MARGIN_X;
-            const uint8_t *col_byte_ptr = vbfb + vbc_base * 64 + byte_in_col;
-            uint8_t out = 0;
-            // Bit 7 = leftmost Playdate pixel in this byte.
-            if (((col_byte_ptr[0 * 64] >> shift) & 3) >= THRESHOLD) out |= 0x80;
-            if (((col_byte_ptr[1 * 64] >> shift) & 3) >= THRESHOLD) out |= 0x40;
-            if (((col_byte_ptr[2 * 64] >> shift) & 3) >= THRESHOLD) out |= 0x20;
-            if (((col_byte_ptr[3 * 64] >> shift) & 3) >= THRESHOLD) out |= 0x10;
-            if (((col_byte_ptr[4 * 64] >> shift) & 3) >= THRESHOLD) out |= 0x08;
-            if (((col_byte_ptr[5 * 64] >> shift) & 3) >= THRESHOLD) out |= 0x04;
-            if (((col_byte_ptr[6 * 64] >> shift) & 3) >= THRESHOLD) out |= 0x02;
-            if (((col_byte_ptr[7 * 64] >> shift) & 3) >= THRESHOLD) out |= 0x01;
-            row[pbyte] = out;
+        for (int bi = 0; bi < (VB_H >> 2); bi++) {
+            uint8_t b = col[bi];
+            if (b == 0) continue;  // common case: empty column slice
+            uint8_t *r = pdfb + (MARGIN_Y + (bi << 2)) * PD_STRIDE + pdb_off;
+            if (((b     ) & 3) >= THRESHOLD) r[0 * PD_STRIDE] |= pdmask;
+            if (((b >> 2) & 3) >= THRESHOLD) r[1 * PD_STRIDE] |= pdmask;
+            if (((b >> 4) & 3) >= THRESHOLD) r[2 * PD_STRIDE] |= pdmask;
+            if (((b >> 6) & 3) >= THRESHOLD) r[3 * PD_STRIDE] |= pdmask;
         }
     }
 
