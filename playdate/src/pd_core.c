@@ -1,0 +1,114 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "pd_api.h"
+#include "pd_core.h"
+
+#include "vb_types.h"
+#include "vb_set.h"
+#include "v810_cpu.h"
+#include "v810_mem.h"
+#include "rom_db.h"
+
+extern void apply_patches(void);
+
+static pd_core_status s_status;
+
+const pd_core_status *pd_core_get_status(void) { return &s_status; }
+
+// Apply a minimal set of tVBOpt defaults sufficient for v810_reset / interpreter.
+static void pd_apply_default_opts(void) {
+    memset(&tVBOpt, 0, sizeof(tVBOpt));
+    tVBOpt.RENDERMODE = RM_TOGPU;     // expected default; reset() may override per game
+    tVBOpt.FRMSKIP = 0;
+    tVBOpt.DEFAULT_EYE = 0;           // left eye
+    tVBOpt.VSYNC = false;
+    tVBOpt.ANAGLYPH = false;
+    tVBOpt.INPUT_BUFFER = 0;
+}
+
+int pd_core_init(PlaydateAPI *pd) {
+    pd_apply_default_opts();
+    v810_init();
+    s_status.loaded = false;
+    pd->system->logToConsole("pd_core_init: V810 state buffers allocated");
+    return 0;
+}
+
+int pd_core_load_rom(PlaydateAPI *pd, const char *path) {
+    SDFile *f = pd->file->open(path, kFileRead);
+    if (!f) {
+        pd->system->logToConsole("pd_core_load_rom: open '%s' failed: %s",
+                                 path, pd->file->geterr());
+        return -1;
+    }
+
+    // Seek to end to get the file size.
+    pd->file->seek(f, 0, SEEK_END);
+    int rom_size = pd->file->tell(f);
+    pd->file->seek(f, 0, SEEK_SET);
+
+    if (rom_size <= 0x10 || rom_size > MAX_ROM_SIZE) {
+        pd->system->logToConsole("pd_core_load_rom: invalid ROM size %d", rom_size);
+        pd->file->close(f);
+        return -2;
+    }
+    // Must be power of two.
+    if (rom_size & (rom_size - 1)) {
+        pd->system->logToConsole("pd_core_load_rom: ROM size %d not power of two",
+                                 rom_size);
+        pd->file->close(f);
+        return -3;
+    }
+
+    int got = pd->file->read(f, V810_ROM1.pmemory, rom_size);
+    pd->file->close(f);
+    if (got != rom_size) {
+        pd->system->logToConsole("pd_core_load_rom: short read %d/%d", got, rom_size);
+        return -4;
+    }
+
+    V810_ROM1.size = rom_size;
+    V810_ROM1.highaddr = 0x07000000 + rom_size - 1;
+
+    // Fill the rest of the address space with copies of the ROM (mirrors).
+    for (int i = rom_size; i < MAX_ROM_SIZE; i += rom_size) {
+        memcpy(V810_ROM1.pmemory + i, V810_ROM1.pmemory, rom_size);
+    }
+
+    is_sram = false;
+    gen_table();
+    tVBOpt.CRC32 = get_crc(rom_size);
+    tVBOpt.GAME_ID = MAKE_GAMEID((char*)(V810_ROM1.off + (V810_ROM1.highaddr & 0xFFFFFDF9)));
+
+    apply_patches();
+    v810_reset();
+
+    s_status.loaded = true;
+    s_status.rom_size = rom_size;
+    s_status.last_run_ret = 0;
+    s_status.last_frame_cycles = 0;
+    s_status.last_frame_ms = 0.0f;
+
+    pd->system->logToConsole("pd_core_load_rom: '%s' loaded, %d bytes, crc=%08lx, gid=%08x",
+                             path, rom_size,
+                             (unsigned long)tVBOpt.CRC32,
+                             (unsigned)tVBOpt.GAME_ID);
+    return 0;
+}
+
+void pd_core_run_frame(PlaydateAPI *pd) {
+    if (!s_status.loaded) return;
+
+    uint32_t start_cycles = vb_state->v810_state.cycles;
+    pd->system->resetElapsedTime();
+
+    int ret = v810_run();
+
+    float elapsed = pd->system->getElapsedTime();
+    s_status.last_frame_ms = elapsed * 1000.0f;
+    s_status.last_frame_cycles = vb_state->v810_state.cycles - start_cycles;
+    s_status.last_run_ret = ret;
+}

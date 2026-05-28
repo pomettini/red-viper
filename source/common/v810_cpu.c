@@ -8,7 +8,9 @@
 #include <strings.h>
 #include <sys/stat.h>
 
+#if !defined(TARGET_PLAYDATE) && !defined(TARGET_SIMULATOR)
 #include "minizip/unzip.h"
+#endif
 
 #include "v810_opt.h"
 #include "v810_cpu.h"
@@ -108,6 +110,9 @@ void v810_init(void) {
     }
 }
 
+#if !defined(TARGET_PLAYDATE) && !defined(TARGET_SIMULATOR)
+// Stdio/minizip ROM loader. On Playdate we load ROMs via the Playdate file
+// API directly into V810_ROM1.pmemory; see playdate/src/pd_core.c.
 static bool load_is_zip;
 static unzFile load_unz;
 static FILE *load_file;
@@ -283,6 +288,7 @@ void v810_load_cancel(void) {
         if (load_sram) fclose(load_sram);
     }
 }
+#endif // !TARGET_PLAYDATE
 
 void v810_exit(void) {
     free(V810_ROM1.pmemory);
@@ -345,7 +351,12 @@ void v810_reset(void) {
     vb_state = &vb_players[emulated_player_id];
 
     // we don't reset load_sram so it will be non-null if there was sram to load
+#if defined(TARGET_PLAYDATE) || defined(TARGET_SIMULATOR)
+    // Playdate path skips the stdio SRAM loader entirely; trust is_sram alone.
+    replay_reset(is_sram);
+#else
     replay_reset(is_sram || (bool)load_sram);
+#endif
 
     // Golf might set this to RM_CPUONLY, so reset it here.
     tVBOpt.RENDERMODE = RM_TOGPU;

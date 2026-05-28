@@ -80,7 +80,15 @@ extern int my_player_id;
 extern int emulated_player_id;
 
 extern V810_MEMORYFETCH V810_ROM1;
+#if defined(TARGET_PLAYDATE) || defined(TARGET_SIMULATOR)
+// Playdate apps have an ~8 MB heap and a 2 MB ROM (Wario Land) already
+// exhausts a chunk of it. Cap at 2 MB — the largest officially licensed
+// VB ROM — so malloc(MAX_ROM_SIZE) doesn't fail at startup. ROMs larger
+// than this will be rejected by pd_core_load_rom.
+#define MAX_ROM_SIZE 0x200000
+#else
 #define MAX_ROM_SIZE 0x1000000
+#endif
 
 extern int is_sram; //Flag if writes to sram...
 

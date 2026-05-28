@@ -5,7 +5,12 @@
 #include "arm_emit.h"
 #include "v810_mem.h"
 
-#if __ARM_ARCH >= 6 && __arm__
+#if defined(TARGET_PLAYDATE) || defined(TARGET_SIMULATOR)
+// Playdate's Cortex-M7 is Thumb-2 only and the existing drc backend emits
+// ARM A32 instructions. Until a Thumb-2 backend is written, force the
+// interpreter path. See playdate/NOTES.md.
+#define DRC_AVAILABLE false
+#elif __ARM_ARCH >= 6 && __arm__
 #define DRC_AVAILABLE true
 #else
 #define DRC_AVAILABLE false
