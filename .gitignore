@@ -1,6 +1,8 @@
 build
 .ccls-cache
 .vscode
+.claude/
+.codex/
 *.3dsx
 *.cia
 *.elf
