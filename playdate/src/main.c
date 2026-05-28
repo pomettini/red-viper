@@ -10,6 +10,7 @@
 
 #include "pd_api.h"
 #include "pd_core.h"
+#include "pd_video.h"
 
 #ifdef _WINDLL
 __declspec(dllexport)
@@ -64,13 +65,18 @@ static int update(void* userdata)
 
     pd_core_run_frame(pd);
 
-    pd->graphics->clear(kColorWhite);
+    if (st->loaded) {
+        // Paints VB output across the whole framebuffer (black borders).
+        pd_video_render_frame(pd);
+        // Mark all rows; drawText below extends past the VB region's bounds.
+        pd->graphics->markUpdatedRows(0, 239);
+    } else {
+        pd->graphics->clear(kColorWhite);
+    }
+
     if (s_font) pd->graphics->setFont(s_font);
 
     char line[96];
-
-    snprintf(line, sizeof(line), "Red Viper PD - v0.1 benchmark");
-    pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 8);
 
     if (s_load_err) {
         snprintf(line, sizeof(line), "ROM error: %s", s_load_err);
@@ -81,17 +87,21 @@ static int update(void* userdata)
         snprintf(line, sizeof(line), "loading...");
         pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 40);
     } else {
-        snprintf(line, sizeof(line), "ROM: %s (%d bytes)", ROM_PATH, st->rom_size);
-        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 40);
-        snprintf(line, sizeof(line), "Last frame: %.2f ms", st->last_frame_ms);
-        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 64);
-        snprintf(line, sizeof(line), "Emulated cycles: %lu",
-                 (unsigned long)st->last_frame_cycles);
-        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 88);
-        snprintf(line, sizeof(line), "v810_run ret: %d", st->last_run_ret);
-        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 112);
-        snprintf(line, sizeof(line), "Beetle VB ref: 28-70 ms warm");
-        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 160);
+        // Telemetry over (likely black) VB output: draw text white-on-
+        // transparent. Top line sits below the FPS overlay (~16 px tall).
+        pd->graphics->setDrawMode(kDrawModeFillWhite);
+        snprintf(line, sizeof(line), "%.1fms %luc f=%lu r=%d",
+                 (double)st->last_frame_ms,
+                 (unsigned long)st->last_frame_cycles,
+                 (unsigned long)st->frames_run,
+                 st->last_run_ret);
+        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 2, 22);
+        snprintf(line, sizeof(line), "PC=%08lx XP=%04x IP=%04x",
+                 (unsigned long)st->pc,
+                 st->xpctrl,
+                 st->intpnd);
+        pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 2, 220);
+        pd->graphics->setDrawMode(kDrawModeCopy);
     }
 
     pd->system->drawFPS(0, 0);

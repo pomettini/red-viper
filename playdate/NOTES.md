@@ -314,6 +314,107 @@ These are starting positions, not final answers. Revise as data comes in.
   hardware too. Future ROM-size policy: load size first, allocate
   exact-fit, only mirror to next power-of-two — saves up to 6 MB on
   256 KB ROMs (most VB titles). Deferred until we need the headroom.
-- **Next step:** read the on-screen ms/frame number now that it
-  actually renders (telemetry-only screen) and commit it as the
-  interpreter-only baseline. Then renderer + input.
+
+### 2026-05-28 — software VIP renderer + 1bpp blit
+
+- Pulled `source/common/video_soft.cpp` (the Red Viper software VIP
+  renderer) into the Playdate build via a symlink at
+  `playdate/core/video_soft.cpp`. This is the existing 2bpp column-major
+  rasterizer; it does BG-world, affine, and OBJ compositing into
+  V810_DISPLAY_RAM at the same offsets the VB hardware writes.
+- Removed the `update_texture_cache_soft` and `video_soft_render` stubs
+  from `pd_stubs.c` — real implementations now link in.
+- Added `playdate/src/pd_video.c` which, per emulated frame:
+  1. If XPEN: runs `update_texture_cache_soft` (on `CharCacheInvalid`)
+     and `video_soft_render(drawn_fb)`.
+  2. Reads the displayed framebuffer (left eye, FB0), threshold-converts
+     2bpp → 1bpp (`value >= 2 ⇒ white`), centers into Playdate's
+     400×240 with 8 px margins.
+  3. `pd->graphics->markUpdatedRows(0, 239)`.
+- Hooked `pd_video_render_frame` from `main.c::update`, replacing the
+  previous "telemetry-only" screen. Telemetry now shows as a compact
+  overlay at y=220 (`%.1fms %lu cy ret=%d`).
+- Build-system surgery (documented for future maintenance):
+  - `common.mk` expands `pdex.elf: $(OBJS)`'s prereqs at parse time,
+    using a `$(SRC:.c=.o)` substitution that leaves `.cpp` extensions
+    untouched. The override in our Makefile couldn't catch the prereq
+    list because make had already baked it in. Two workarounds applied:
+    1. We redefined `pdex.elf` with our own recipe that links
+       `$(RV_OBJS)` (a properly substituted list). Make warns about
+       duplicate recipes but uses the latest (ours).
+    2. The original (stale) prereq list still contains
+       `build/core/video_soft.cpp` — that prereq is satisfied with a
+       no-op `cp` rule that stages the .cpp into the build dir. Our
+       relinking rule ignores it.
+  - Added a `%.o : %.cpp` pattern rule that calls
+    `arm-none-eabi-g++ -fno-exceptions -fno-rtti`. The .cpp file
+    avoids RTTI / exceptions / STL, so plain gcc-driven linking works
+    without pulling in libstdc++.
+- Verified the .pdx launches cleanly in the Playdate Simulator: ROM
+  loads, CRC `133E9372` (Wario Land J) matches, simulator stays
+  running. Visual output of the renderer not yet confirmed from CLI
+  (requires looking at the simulator window); user will read the
+  on-screen `%.1fms %lu cy` telemetry to capture the first
+  interpreter+render baseline.
+- **Next step:** read telemetry; if rendering looks plausible (title
+  card or similar), add input mapping so we can press Start and watch
+  the demo. If the screen is black/garbage, debug the soft renderer's
+  XPEN gating (game may not have reached the state that enables the
+  VIP pipeline yet — at which point only direct CPU framebuffer
+  writes would be visible).
+
+### 2026-05-28 — first picture: Wario Land precaution screen rendering
+
+User screenshot from the Playdate Simulator showed Virtual Boy Wario
+Land's bilingual "IMPORTANT: Read instruction and precaution booklets
+before operating" disclaimer screen, rendered with legible English and
+Japanese kanji/kana, centered 384×224 inside the Playdate's 400×240
+display. First emulated frame to produce a visible picture.
+
+End-to-end pipeline confirmed working:
+
+- V810 interpreter executes past the boot vector into game code
+  (`PC=0xFFFC2326`, ROM offset 0x1C2326 after VB's address mirroring).
+- VIP state machine ticks: `XPCTRL & XPEN = 0x0002` ⇒ pixel pipeline
+  enabled, all relevant interrupt bits pending (`INTPND = 0x401e =
+  LFBEND | RFBEND | GAMESTART | FRAMESTART | XPEND`).
+- Soft VIP renderer (`source/common/video_soft.cpp` linked from
+  `playdate/core/`) composites BG worlds and OBJ data into
+  V810_DISPLAY_RAM at the right offsets.
+- `update_texture_cache_soft` populates the CHR-derived tileCache;
+  text glyphs reconstruct correctly.
+- `pd_video.c`'s 2bpp → 1bpp threshold (value ≥ 2 ⇒ white) preserves
+  enough detail that the precaution screen text is readable.
+- Centering (8 px / 8 px margins) is correct.
+- 648 emulated VB frames at this point ⇒ approx 13 s of VB wall-clock
+  time, 32 s of Playdate wall-clock time at 20 fps target.
+
+**Telemetry read from the screenshot:** `2.5 ms / 420503 cy / r=0`.
+**Critical caveat: this is on host Mac via the simulator dylib, NOT
+on Cortex-M7 hardware.** The Mac is roughly 100× faster per cycle
+than the Playdate ARM, and there is no SDRAM-stall penalty on the
+host. The 2.5 ms means almost nothing for predicting real device
+performance — it just confirms the architecture builds and runs
+end-to-end without falling over.
+
+The real benchmark — and the only number that matters — is ms/frame
+**on actual Playdate hardware** (Cortex-M7 @ ~180 MHz, 16 KB D-cache
+on top of 16 MB SDRAM). Beetle VB's postmortem says the same code
+shape will be a SDRAM-stall fight; we expect a steep slow-down going
+from simulator to device. Capture that next.
+
+Also unresolved / to investigate:
+
+- White-on-transparent text overlay (`kDrawModeFillWhite`) was needed
+  because the original `kDrawModeCopy` rendered black-on-black over
+  the (mostly black) VB output. Worth keeping the draw-mode toggle
+  pattern in mind for any future on-game-screen UI.
+- The precaution screen may persist longer than expected because the
+  game's wait loop runs on its internal timer, which advances at
+  the emulator's emulated speed, not Playdate wall clock. Need to
+  watch whether `f=` keeps climbing and PC eventually leaves the
+  `0xFFFCxxxx` ROM region.
+
+- **Next step:** test input — confirm A / A+B (Start) / D-pad reach
+  the game by watching `PC` change. Then run on **real Playdate
+  hardware** and capture the first device-side ms/frame number.

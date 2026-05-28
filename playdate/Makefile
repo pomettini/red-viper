@@ -27,11 +27,13 @@ SRC = \
 	src/main.c \
 	src/pd_core.c \
 	src/pd_stubs.c \
+	src/pd_video.c \
 	core/v810_cpu.c \
 	core/v810_ins.c \
 	core/v810_mem.c \
 	core/interpreter.c \
 	core/video_common.c \
+	core/video_soft.cpp \
 	core/patches.c \
 	core/rom_db.c
 
@@ -47,3 +49,36 @@ ULIBDIR =
 ULIBS =
 
 include $(SDK)/C_API/buildsupport/common.mk
+
+# ---------------------------------------------------------------------------
+# C++ support (Red Viper's video_soft.cpp uses two templates).
+#
+# common.mk does `_OBJS = $(SRC:.c=.o)` and `$(OBJDIR)/pdex.elf: $(OBJS)`,
+# but the prereq list of pdex.elf is expanded at parse time — before any
+# override here can run — so .cpp files leak into the link prereqs as
+# .cpp paths. Re-define pdex.elf below with a corrected OBJS list.
+#
+# Linking is still done by gcc (not g++). video_soft.cpp deliberately
+# avoids RTTI, exceptions, STL, and anything that would pull in
+# libstdc++ symbols, so plain gcc-driven linking works.
+RV_OBJS := $(addprefix $(OBJDIR)/, $(patsubst %.cpp,%.o,$(patsubst %.c,%.o,$(SRC))))
+
+CXXFLAGS = $(CPFLAGS) -fno-exceptions -fno-rtti
+
+$(OBJDIR)/%.o : %.cpp | MKOBJDIR MKDEPDIR
+	@mkdir -p `dirname $@`
+	$(GCC)$(TRGT)g++ -c $(CXXFLAGS) -I . $(INCDIR) $< -o $@
+
+# Re-define the device link rule. The recipe defined here wins over the
+# one in common.mk (make warns but uses the latest).
+$(OBJDIR)/pdex.elf: $(RV_OBJS) $(LDSCRIPT)
+	$(CC) $(RV_OBJS) $(LDFLAGS) $(LIBS) -o $@
+
+# common.mk's pdex.elf rule has a stale prereq list ($(OBJS) was expanded
+# at parse-time, with .cpp untranslated), which leaves "build/core/
+# video_soft.cpp" hanging in the merged prereq set. Satisfy it with a
+# noop copy so make's dependency check passes; the actual link uses
+# RV_OBJS, not OBJS, so this copy isn't really referenced.
+$(OBJDIR)/%.cpp: %.cpp | MKOBJDIR
+	@mkdir -p `dirname $@`
+	@cp $< $@

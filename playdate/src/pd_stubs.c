@@ -74,8 +74,8 @@ void video_flush(bool default_for_both) { (void)default_for_both; }
 void video_quit(void) {}
 void video_download_vip(int drawn_fb) { (void)drawn_fb; }
 void video_hard_render(int drawn_fb) { (void)drawn_fb; }
-void video_soft_render(int drawn_fb) { (void)drawn_fb; }
-void update_texture_cache_soft(void) {}
+// video_soft_render and update_texture_cache_soft come from
+// source/common/video_soft.cpp (compiled via core/video_soft.cpp symlink).
 void update_texture_cache_hard(void) {}
 
 // ---------------------------------------------------------------------------

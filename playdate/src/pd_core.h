@@ -14,7 +14,12 @@ typedef struct {
     int         rom_size;          // bytes of ROM data actually loaded
     int         last_run_ret;      // return value of v810_run() last frame
     uint32_t    last_frame_cycles; // emulated cycles in the last run_frame
+    uint32_t    total_cycles;      // emulated cycles since reset
     float       last_frame_ms;     // measured wall-clock ms in the last run_frame
+    uint32_t    pc;                // V810 PC after last run
+    uint16_t    xpctrl;            // tVIPREG.XPCTRL after last run
+    uint16_t    intpnd;            // tVIPREG.INTPND after last run
+    uint32_t    frames_run;        // count of VB frames the interpreter has produced
 } pd_core_status;
 
 // Returns 0 on success; negative on failure. Diagnostics printed via pd->system->logToConsole.

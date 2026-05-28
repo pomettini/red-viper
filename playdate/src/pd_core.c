@@ -8,11 +8,45 @@
 
 #include "vb_types.h"
 #include "vb_set.h"
+#include "vb_dsp.h"
 #include "v810_cpu.h"
 #include "v810_mem.h"
 #include "rom_db.h"
 
 extern void apply_patches(void);
+
+// Map current Playdate button state to a VB input HWORD and write it into
+// tHReg.SLB / tHReg.SHB so the next v810_run sees it. The 0x0002 bit is the
+// "controller ID present" sentinel the VB always sees from a connected pad.
+//
+// Playdate has only A/B/D-pad. Start/Select don't exist as physical buttons
+// here; we map them creatively:
+//   - Playdate A    -> VB A
+//   - Playdate B    -> VB B
+//   - Playdate D-pad-> VB Left D-pad
+//   - A + B together-> VB Start (held briefly to advance title screens)
+// (Right D-pad and Select are post-MVP.)
+static void pd_update_input(PlaydateAPI *pd) {
+    PDButtons cur;
+    pd->system->getButtonState(&cur, NULL, NULL);
+
+    HWORD k = 0x0002;
+    bool a = (cur & kButtonA) != 0;
+    bool b = (cur & kButtonB) != 0;
+    if (a && b) {
+        k |= VB_KEY_START;
+    } else {
+        if (a) k |= VB_KEY_A;
+        if (b) k |= VB_KEY_B;
+    }
+    if (cur & kButtonUp)    k |= VB_LPAD_U;
+    if (cur & kButtonDown)  k |= VB_LPAD_D;
+    if (cur & kButtonLeft)  k |= VB_LPAD_L;
+    if (cur & kButtonRight) k |= VB_LPAD_R;
+
+    vb_state->tHReg.SLB = (BYTE)k;
+    vb_state->tHReg.SHB = (BYTE)(k >> 8);
+}
 
 static pd_core_status s_status;
 
@@ -102,6 +136,8 @@ int pd_core_load_rom(PlaydateAPI *pd, const char *path) {
 void pd_core_run_frame(PlaydateAPI *pd) {
     if (!s_status.loaded) return;
 
+    pd_update_input(pd);
+
     uint32_t start_cycles = vb_state->v810_state.cycles;
     pd->system->resetElapsedTime();
 
@@ -110,5 +146,10 @@ void pd_core_run_frame(PlaydateAPI *pd) {
     float elapsed = pd->system->getElapsedTime();
     s_status.last_frame_ms = elapsed * 1000.0f;
     s_status.last_frame_cycles = vb_state->v810_state.cycles - start_cycles;
+    s_status.total_cycles += s_status.last_frame_cycles;
     s_status.last_run_ret = ret;
+    s_status.pc = vb_state->v810_state.PC;
+    s_status.xpctrl = vb_state->tVIPREG.XPCTRL;
+    s_status.intpnd = vb_state->tVIPREG.INTPND;
+    s_status.frames_run++;
 }
