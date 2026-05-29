@@ -10,11 +10,6 @@
 // Everywhere else they call the plain mem_* functions directly.
 #if defined(TARGET_PLAYDATE) || defined(TARGET_SIMULATOR)
 #include "pd_itcm.h"
-// Debug hook: logs each loop the busywait detector classifies as idle, once
-// per unique branch PC. Implemented in pd_core.c. Used to find loops that get
-// wrongly fast-forwarded (game-compat debugging).
-void rv_busywait_dbg(WORD branch_pc, WORD target_pc);
-#define RV_BW_DBG(b, t) rv_busywait_dbg((b), (t))
 #else
 #define MEM_RBYTE   mem_rbyte
 #define MEM_RHWORD  mem_rhword
@@ -22,7 +17,6 @@ void rv_busywait_dbg(WORD branch_pc, WORD target_pc);
 #define MEM_WBYTE   mem_wbyte
 #define MEM_WHWORD  mem_whword
 #define MEM_WWORD   mem_wword
-#define RV_BW_DBG(b, t) ((void)0)
 #endif
 
 // Fast-path instruction fetch. The generic MEM_RHWORD() lives in another
@@ -121,7 +115,6 @@ static inline bool is_busywait_loop(WORD target_pc, WORD branch_pc) {
     bool b = busywait_body_ok(target_pc, branch_pc);
     bw_cache[idx].branch_pc = branch_pc;
     bw_cache[idx].busy = b;
-    if (b) RV_BW_DBG(branch_pc, target_pc);
     return b;
 }
 

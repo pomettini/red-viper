@@ -34,7 +34,10 @@
 #include "v810_mem.h"
 
 extern void update_texture_cache_soft(void);
-extern void video_soft_render(int drawn_fb);
+extern void video_soft_render_1bpp(void);
+extern uint8_t pd_render_fb1[];   // 1bpp column-major, 32 bytes/column
+
+#define RV_FB1_STRIDE 32
 
 #define VB_W            384
 #define VB_H            224
@@ -46,31 +49,15 @@ extern void video_soft_render(int drawn_fb);
 #define THRESHOLD       2     // VB value >= threshold => Playdate white
 
 void pd_video_vip_step(PlaydateAPI *pd) {
+    (void)pd;
     if (!vb_state) return;
 
-    int displayed_fb = vb_state->tVIPREG.tDisplayedFB & 1;
-    int drawn_fb = tVBOpt.DOUBLE_BUFFER ? displayed_fb : 0;
-
     if (vb_state->tVIPREG.XPCTRL & XPEN) {
-        // Split-timing instrumentation: find where vip's cost goes (tile-cache
-        // rebuild vs world/object compositing) before optimising. ms-resolution
-        // is coarse but enough to see the dominant part. Logged every 60 frames.
-        unsigned t0 = pd->system->getCurrentTimeMilliseconds();
         if (tDSPCACHE.CharCacheInvalid) {
             update_texture_cache_soft();
         }
-        unsigned t1 = pd->system->getCurrentTimeMilliseconds();
-        video_soft_render(drawn_fb);
-        unsigned t2 = pd->system->getCurrentTimeMilliseconds();
 
-        static unsigned acc_cache, acc_render, n;
-        acc_cache += (t1 - t0);
-        acc_render += (t2 - t1);
-        if (++n >= 60) {
-            pd->system->logToConsole("vipsplit: cache=%u render=%u ms (avg over %u)",
-                                     acc_cache / n, acc_render / n, n);
-            acc_cache = acc_render = n = 0;
-        }
+        video_soft_render_1bpp();
 
         // The original renderer-driver in source/common/video.c clears these
         // after a render pass; we keep the same convention so subsequent
@@ -84,40 +71,38 @@ void pd_video_vip_step(PlaydateAPI *pd) {
 void pd_video_blit(PlaydateAPI *pd) {
     if (!vb_state) return;
 
-    int displayed_fb = vb_state->tVIPREG.tDisplayedFB & 1;
-    int drawn_fb = tVBOpt.DOUBLE_BUFFER ? displayed_fb : 0;
-    int read_fb = tVBOpt.DOUBLE_BUFFER ? displayed_fb : drawn_fb;
-    const uint8_t *vbfb =
-        (const uint8_t *)(vb_state->V810_DISPLAY_RAM.off + 0x8000 * read_fb);
+    // The renderer already composited directly to 1bpp in pd_render_fb1, so the
+    // blit just transposes the column-major VB layout into the row-major
+    // Playdate framebuffer — no threshold/shade work left.
+    const uint8_t *vbfb = pd_render_fb1;
 
     uint8_t *pdfb = pd->graphics->getFrame();
     if (!pdfb) return;
 
-    // Clear all rows to black; we only OR in the VB-bright pixels.
+    // Clear all rows to black; we only OR in the bright pixels.
     memset(pdfb, 0x00, PD_H * PD_STRIDE);
 
-    // Iterate by VB column, not by Playdate row, so the SDRAM reads are
-    // sequential within each 64-byte VB column. Each column lives in two
-    // 32-byte cache lines, so ~2 cache misses per column instead of one
-    // miss per pixel — drops total misses from ~86k to ~768.
-    //
-    // Each VB byte holds 4 consecutive rows of one column, so one read
-    // produces four scattered writes into the Playdate framebuffer.
-    // Playdate FB sits in fast (cached) RAM so the scatter is cheap.
+    // Iterate by VB column so the reads are sequential within each 32-byte VB
+    // column. Each byte holds 8 consecutive rows of one column (bit r = row r),
+    // producing up to eight scattered writes into the Playdate framebuffer.
     for (int vbc = 0; vbc < VB_W; vbc++) {
-        const uint8_t *col = vbfb + vbc * 64;
+        const uint8_t *col = vbfb + vbc * RV_FB1_STRIDE;
         int px = vbc + MARGIN_X;
         int pdb_off = px >> 3;
         uint8_t pdmask = (uint8_t)(0x80 >> (px & 7));
 
-        for (int bi = 0; bi < (VB_H >> 2); bi++) {
+        for (int bi = 0; bi < (VB_H >> 3); bi++) {
             uint8_t b = col[bi];
             if (b == 0) continue;  // common case: empty column slice
-            uint8_t *r = pdfb + (MARGIN_Y + (bi << 2)) * PD_STRIDE + pdb_off;
-            if (((b     ) & 3) >= THRESHOLD) r[0 * PD_STRIDE] |= pdmask;
-            if (((b >> 2) & 3) >= THRESHOLD) r[1 * PD_STRIDE] |= pdmask;
-            if (((b >> 4) & 3) >= THRESHOLD) r[2 * PD_STRIDE] |= pdmask;
-            if (((b >> 6) & 3) >= THRESHOLD) r[3 * PD_STRIDE] |= pdmask;
+            uint8_t *r = pdfb + (MARGIN_Y + (bi << 3)) * PD_STRIDE + pdb_off;
+            if (b & 0x01) r[0 * PD_STRIDE] |= pdmask;
+            if (b & 0x02) r[1 * PD_STRIDE] |= pdmask;
+            if (b & 0x04) r[2 * PD_STRIDE] |= pdmask;
+            if (b & 0x08) r[3 * PD_STRIDE] |= pdmask;
+            if (b & 0x10) r[4 * PD_STRIDE] |= pdmask;
+            if (b & 0x20) r[5 * PD_STRIDE] |= pdmask;
+            if (b & 0x40) r[6 * PD_STRIDE] |= pdmask;
+            if (b & 0x80) r[7 * PD_STRIDE] |= pdmask;
         }
     }
 

@@ -50,30 +50,8 @@ static void pd_update_input(PlaydateAPI *pd) {
 }
 
 static pd_core_status s_status;
-static PlaydateAPI *s_pd;
 
 const pd_core_status *pd_core_get_status(void) { return &s_status; }
-
-// Debug hook called by the interpreter the first time it classifies a loop as
-// a busywait. Logs the branch/target PCs and the loop body (decoded from ROM)
-// once per unique branch PC, so we can see which loop a game hangs on.
-void rv_busywait_dbg(WORD branch_pc, WORD target_pc) {
-    static WORD seen[24];
-    static int nseen = 0;
-    for (int i = 0; i < nseen; i++) if (seen[i] == branch_pc) return;
-    if (nseen < 24) seen[nseen++] = branch_pc;
-    if (!s_pd) return;
-
-    uint32_t mask = (0x07000000u | (MAX_ROM_SIZE - 1)) & ~1u;
-    uint16_t b[6];
-    for (int i = 0; i < 6; i++)
-        b[i] = *(uint16_t *)(V810_ROM1.off + ((target_pc + i * 2) & mask));
-
-    s_pd->system->logToConsole(
-        "BW br=%08lx tgt=%08lx body=%04x %04x %04x %04x %04x %04x",
-        (unsigned long)branch_pc, (unsigned long)target_pc,
-        b[0], b[1], b[2], b[3], b[4], b[5]);
-}
 
 // Apply a minimal set of tVBOpt defaults sufficient for v810_reset / interpreter.
 static void pd_apply_default_opts(void) {
@@ -87,7 +65,6 @@ static void pd_apply_default_opts(void) {
 }
 
 int pd_core_init(PlaydateAPI *pd) {
-    s_pd = pd;
     pd_apply_default_opts();
     v810_init();
     rv_itcm_init(); // route mem accessors through g_rv_* (default: plain mem_*)

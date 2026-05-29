@@ -995,6 +995,56 @@ optimisation is deferred to step 4.
 translator ran off the end of the test arrays. Switched the sentinel to
 `JMP`, which is genuinely unsupported. Not a translator bug.)
 
+## 2026-05-30 — 1-BIT RENDERER REWRITE: DONE & MEASURED (the big renderer win)
+
+Implemented the direct-to-1bpp composite path the earlier note flagged as "the
+only big renderer lever left." It lives in `source/common/video_soft.cpp`
+behind `#ifdef RV_1BPP` (Playdate/Simulator only); the 3DS 2bpp path is
+untouched. `pd_video.c` now calls `video_soft_render_1bpp()` and the blit just
+transposes the 1bpp column-major scratch (`pd_render_fb1`, 32 B/col) into the
+Playdate framebuffer — no threshold pass.
+
+Design:
+- New 1bpp tile cache (`tileCache1[]`) derived from the existing 2bpp
+  `indices.u16[]` in `update_texture_cache_soft`: per column, an 8-bit
+  transparency mask + three 8-bit "pixels with colour index c" masks (c=1..3).
+- A pixel is white iff its palette-mapped shade ≥ 2 (the same threshold the old
+  2bpp→1bpp blit used). At render time we OR the idx masks whose palette shade
+  ≥ 2 → 8-bit bright column. Opacity mask is palette-independent.
+- `render_normal_world_1bpp<aligned,over>` is a faithful /2 port of the 2bpp
+  normal-world renderer (every 2-bit shift halved, 8-bit words, 32 B/col fb).
+  Objects ported likewise. `render_affine_world_1bpp<over>` samples
+  `tileCache[].indices` per pixel and thresholds via GPLT, like the 2bpp one.
+- Left eye only (Playdate is mono). h-bias (bgm==1) still unimplemented — it is
+  a TODO in the original 2bpp software renderer too (3DS draws h-bias on the
+  GPU, which we don't have).
+
+Measured on hardware:
+- **Wario Land (normal+object dominant): `vip` 25–45 ms → ~2 ms menus / ~10 ms
+  gameplay.** The renderer is no longer the wall. Played through to level 2 with
+  no visible regression. The frame is now **CPU-bound**: `int` ≈ 32 ms menus,
+  ~45 ms level 1, **60–115 ms level 2**; `vip` ~10 ms, `blit` ~1.6 ms.
+- **Mario's Tennis (affine-heavy): title now renders** (it's two `bgm=2` affine
+  worlds, `head=e080/e003` — that's why it was blank before affine was ported).
+  But `vip` for the attract/court scene is ~44 ms — **affine did NOT get
+  faster.** Affine iterates horizontally across columns, so every pixel is a
+  scattered byte RMW into a different column (32 B apart) plus two scattered
+  SDRAM reads (tilemap + tile indices); the access pattern, not the bit-width,
+  dominates and is identical to the old 2bpp path. The title logo alone (small
+  affine) is ~11.8 ms.
+
+Takeaways:
+- The 1bpp rewrite is a decisive win for normal-world/object games (the common
+  case, and the project's "less demanding games" target). ~1.5–2× was the
+  estimate; for Wario's render specifically it's far more because the per-column
+  tileCache working set shrank from ~32 B to ~4 B and stays in the 16 KB cache.
+- Affine games (Tennis court, Red Alarm, etc.) remain renderer-heavy; speeding
+  affine would need a different layout (e.g. render affine row-major into a
+  scratch line then transpose) — deferred, separate lever.
+- **Conclusion: with the renderer fixed, the CPU interpreter is now the
+  bottleneck for Wario Land** — which is exactly what the dynarec (Option 3)
+  targets. Proceeding there next.
+
 ## HONEST CHECKPOINT before the dispatcher (step 3d)
 
 The straight-line translator is complete and trustworthy. What remains for a

@@ -192,6 +192,12 @@ void video_hard_render(int drawn_fb);
 void video_soft_render(int drawn_fb);
 void update_texture_cache_soft(void);
 
+#if defined(TARGET_PLAYDATE) || defined(TARGET_SIMULATOR)
+// 1bpp composite path for the Playdate's mono display (see video_soft.cpp).
+void video_soft_render_1bpp(void);
+extern unsigned char pd_render_fb1[];
+#endif
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
