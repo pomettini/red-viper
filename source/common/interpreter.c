@@ -10,6 +10,11 @@
 // Everywhere else they call the plain mem_* functions directly.
 #if defined(TARGET_PLAYDATE) || defined(TARGET_SIMULATOR)
 #include "pd_itcm.h"
+// Debug hook: logs each loop the busywait detector classifies as idle, once
+// per unique branch PC. Implemented in pd_core.c. Used to find loops that get
+// wrongly fast-forwarded (game-compat debugging).
+void rv_busywait_dbg(WORD branch_pc, WORD target_pc);
+#define RV_BW_DBG(b, t) rv_busywait_dbg((b), (t))
 #else
 #define MEM_RBYTE   mem_rbyte
 #define MEM_RHWORD  mem_rhword
@@ -17,6 +22,7 @@
 #define MEM_WBYTE   mem_wbyte
 #define MEM_WHWORD  mem_whword
 #define MEM_WWORD   mem_wword
+#define RV_BW_DBG(b, t) ((void)0)
 #endif
 
 // Fast-path instruction fetch. The generic MEM_RHWORD() lives in another
@@ -115,6 +121,7 @@ static inline bool is_busywait_loop(WORD target_pc, WORD branch_pc) {
     bool b = busywait_body_ok(target_pc, branch_pc);
     bw_cache[idx].branch_pc = branch_pc;
     bw_cache[idx].busy = b;
+    if (b) RV_BW_DBG(branch_pc, target_pc);
     return b;
 }
 
@@ -418,21 +425,28 @@ int interpreter_run(void) {
                 // spinning (mirrors the DRC and the HALT handler below).
                 // last_PC holds the branch instruction's own address; PC now
                 // holds the branch target.
+                // (Gate RV_NO_BUSYWAIT lets us A/B the detector for game-compat
+                // debugging without removing it.)
+#ifndef RV_NO_BUSYWAIT
                 if (disp <= 0
                     && (last_PC & 0x07000000) == 0x07000000
                     && is_busywait_loop(PC, last_PC)) {
-                    cycles = target;
+                    // Idle spin: nothing the loop does changes its own exit
+                    // condition until the next scheduled event, so skip the
+                    // redundant iterations by jumping cycles to that event,
+                    // then RETURN so the loop body re-runs and re-evaluates
+                    // its condition. We must NOT keep fast-forwarding past
+                    // events HALT-style: the exit may be a non-interrupt
+                    // state change (e.g. polling DPSTTS & DPBSY), which only
+                    // gets re-checked by re-executing the loop body. (That
+                    // HALT-style bug hung Mario's Tennis's boot poll forever.)
+                    if ((SWORD)(target - cycles) > 0)
+                        cycles = target;
                     vb_state->v810_state.PC = PC;
-                    do {
-                        cycles += vb_state->v810_state.cycles_until_event_partial;
-                        vb_state->v810_state.cycles_until_event_partial = vb_state->v810_state.cycles_until_event_full = 0;
-                        vb_state->v810_state.cycles = cycles;
-                        serviceInt(cycles, PC);
-                    } while (!vb_state->v810_state.ret && vb_state->v810_state.PC == PC);
-                    // PC is either the (unchanged) loop target or an interrupt
-                    // vector; vb_state already holds it. Return like HALT.
+                    vb_state->v810_state.cycles = cycles;
                     return 0;
                 }
+#endif
             } else {
                 // branch not taken, so it only took 1 cycle
                 cycles -= 2;

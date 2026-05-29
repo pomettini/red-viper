@@ -658,6 +658,48 @@ Recommendation: the assessment question is answered. Next concrete step is
 the user's strategic call between (1)/(2)/(3) — captured in the session
 log. Whichever path, the cheap-win phase is complete and well-measured.
 
+### 2026-05-29 — busywait bug found & fixed; light-game finding reframes the bottleneck
+
+**Busywait detection bug (fixed).** Mario's Tennis hung at boot (black
+screen, PC pinned). Diagnosed by logging the loop the detector flagged:
+```
+LD_H r1,[r2]; ANDI r1,r1,#0x3c; BE loop   ; wait while (([r2] & DPBSY)==0)
+```
+0x3c = L0BSY|R0BSY|L1BSY|R1BSY (DPBSY) — it polls a VIP display-busy bit
+that the VIP sets *mid-frame without an interrupt*. My fast-forward was
+copied from HALT, which services events only until an *interrupt* moves PC.
+A data-poll loop never moves PC, so it skipped past the bit-set moment,
+never re-ran the loop body to notice, and at frame boundaries DPBSY is 0 →
+infinite spin. **Fix:** on a detected busywait, skip idle cycles to the next
+event and RETURN, so the loop body re-runs and re-checks its real condition
+each event (instead of HALT-style spinning to frame end). Correct AND still
+skips the idle iterations. Tennis now boots and runs; Wario Land unaffected.
+
+**MAJOR FINDING — for light games the renderer, not the CPU, is the wall.**
+Mario's Tennis (a light game) gameplay, on the interpreter:
+- `int ≈ 22 ms`  (CPU emulation — near the 20 ms real-time budget!)
+- `vip ≈ 28–34 ms` (software VIP renderer — now the BIGGER cost)
+- `blit ≈ 2 ms`, `tot ≈ 52–59 ms` ⇒ ~17–19 fps (~36% speed)
+
+This is the OPPOSITE of Wario Land (CPU 45 ms dominated, render 20–25 ms).
+For a light game the CPU is nearly real-time, and the **software VIP
+renderer is the bottleneck** — and that renderer is red-viper's CPU-fallback
+path (the 3DS uses the PICA200 GPU instead), so it's largely un-optimised.
+
+**Reframed conclusion:** "less-demanding games at real-time" needs BOTH
+~2–3x improvements, and which one dominates depends on the game:
+- CPU-heavy games (Wario Land): the dynarec is the lever (CPU 45→~25 ms),
+  but the memory wall caps it ~70% — likely never full real-time.
+- Render-heavy / CPU-light games (Mario's Tennis): the **renderer** is the
+  lever (vip 30→~10 ms); the CPU is already close. The dynarec would NOT
+  make Tennis real-time on its own — the renderer caps it.
+
+So the single highest-value remaining target for the *light-game* use case
+is **optimising the software VIP renderer** (or writing a Playdate-native
+1-bit renderer), not finishing the dynarec. Both are ~2–3x problems now —
+far more tractable than Wario Land's 5–10x. The project's core question
+("viable for less-demanding games?") is trending YES, gated on the renderer.
+
 ## DYNAREC TRACK (user chose option 3: Thumb-2 backend)
 
 ### 2026-05-28 — step 1: RWX / cache-flush feasibility probe

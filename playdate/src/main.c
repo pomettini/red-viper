@@ -26,7 +26,7 @@ static const char* SYSTEM_FONT_PATH =
 static LCDFont* s_font = NULL;
 static const char* s_load_err = NULL;
 
-static const char* ROM_PATH = "warioland.vb";
+static const char* ROM_PATH = "marios_tennis.vb";
 
 int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 {
@@ -76,11 +76,9 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 // every other; =2 every third; etc. The interpreter still runs every frame
 // so VB game timing stays correct; only the visible refresh slows.
 //
-// TEMPORARY FEEL-TEST CONFIG: render every other frame so the skipped frames
-// cost interpreter-only time, letting more emulated VB frames through per
-// second. Note this does NOT reach real-time — emulation is the cap. Set
-// back to 0 for accurate per-frame profiling.
-#define RENDER_SKIP 1
+// Full rendering for accurate per-frame profiling (real-time play needs
+// every frame rendered anyway). =1+ skips render frames for a feel test.
+#define RENDER_SKIP 0
 
 static struct {
     int     count;
