@@ -55,8 +55,10 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
         // generated Thumb-2 code before building the emitter.
         pd_jit_test(pd);
 
-        // 20 fps target (50 ms budget). See playdate/NOTES.md §5.
-        pd->display->setRefreshRate(20.0f);
+        // Feel test: uncap to the panel's 50 Hz so emulation runs as fast as
+        // it can (the old 20 fps cap was throttling simple scenes to 40%
+        // speed for no reason). Real game speed is still emulation-bound.
+        pd->display->setRefreshRate(50.0f);
         pd->system->setUpdateCallback(update, pd);
     }
 
@@ -73,7 +75,12 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 // Render frame skip. RENDER_SKIP=0 renders every Playdate frame; =1 renders
 // every other; =2 every third; etc. The interpreter still runs every frame
 // so VB game timing stays correct; only the visible refresh slows.
-#define RENDER_SKIP 0
+//
+// TEMPORARY FEEL-TEST CONFIG: render every other frame so the skipped frames
+// cost interpreter-only time, letting more emulated VB frames through per
+// second. Note this does NOT reach real-time — emulation is the cap. Set
+// back to 0 for accurate per-frame profiling.
+#define RENDER_SKIP 1
 
 static struct {
     int     count;
