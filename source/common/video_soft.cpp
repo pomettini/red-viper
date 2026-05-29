@@ -322,7 +322,11 @@ void video_soft_render(int drawn_fb) {
         if (worlds[wrld].on == 0)
             continue;
 
-        // set softbuf modified area for background worlds
+        // set softbuf modified area for background worlds.
+        // SoftBufWrote drives the 3DS GPU partial-upload path; on Playdate we
+        // blit the whole frame, so this per-column bookkeeping is pure
+        // overhead — skip it there.
+#if !defined(TARGET_PLAYDATE) && !defined(TARGET_SIMULATOR)
         if (worlds[wrld].bgm != 3) {
             int16_t base_gx = (s16)(worlds[wrld].gx << 6) >> 6;
             int16_t gp = (s16)(worlds[wrld].gp << 6) >> 6;
@@ -350,7 +354,8 @@ void video_soft_render(int drawn_fb) {
                 if (column->max < max) column->max = max;
             }
         }
-        
+#endif
+
         if (worlds[wrld].bgm == 0) {
             // normal world
             for (int eye = 0; eye < SOFT_EYE_COUNT; eye++) {
@@ -404,6 +409,8 @@ void video_soft_render(int drawn_fb) {
 
                 s16 jp = (s16)(cw1 << 6) >> 6;
 
+                // SoftBufWrote bounds: 3DS GPU-upload only; skip on Playdate.
+#if !defined(TARGET_PLAYDATE) && !defined(TARGET_SIMULATOR)
                 for (int x = (base_x - abs(jp)) & ~7; x < base_x + abs(jp) && x < 384; x += 8) {
                     if (x < 0) continue;
                     SOFTBOUND *column = &tDSPCACHE.SoftBufWrote[drawn_fb][x / 8];
@@ -415,6 +422,7 @@ void video_soft_render(int drawn_fb) {
                     if (max > 31) max = 31;
                     if (column->max < max) column->max = max;
                 }
+#endif
 
                 for (int eye = 0; eye < SOFT_EYE_COUNT; eye++) {
                     if (!(cw1 & (0x8000 >> eye)))

@@ -700,6 +700,84 @@ is **optimising the software VIP renderer** (or writing a Playdate-native
 far more tractable than Wario Land's 5–10x. The project's core question
 ("viable for less-demanding games?") is trending YES, gated on the renderer.
 
+### 2026-05-29 — vip split-timing: it's all in video_soft_render
+
+Split `vip` into tile-cache rebuild vs world/object composite on Mario's
+Tennis: `cache=0 render=50` (title) / `cache=0 render=24–30` (gameplay).
+- `update_texture_cache_soft` (dirty-tile rebuild) ≈ **0 ms** — the dirty
+  tracking is already optimal; not a target.
+- **100% of the cost is `video_soft_render`** — per-pixel compositing of
+  the BG/OBJ worlds into the 2bpp column-major framebuffer.
+
+So the renderer target is the compositing inner loops, not caching. Known
+levers, roughly in order of effort:
+1. **Cut Playdate-unused work:** `video_soft_render` maintains the
+   `SoftBufWrote` dirty-column bounds for the 3DS GPU-upload path. On
+   Playdate we blit the whole frame, so that bookkeeping is pure overhead —
+   gate it out. Low risk, unknown (probably small) win.
+2. **Render directly to 1-bit** instead of 2bpp + threshold blit. The user
+   prioritises feel over graphic fidelity, and we discard the brightness
+   levels anyway, so the 4-level shading work + the 2bpp memory traffic +
+   the separate blit are all avoidable. Biggest lever (~2x plausible) but a
+   substantial rewrite of video_soft.cpp's tileCache / get_tile_column /
+   per-world write loops, with hard-fault risk.
+
+**Overall state, stated honestly (both representative games characterised):**
+- Mario's Tennis (light): int≈22 ms (just over the 20 ms real-time budget),
+  render≈25–50 ms (bottleneck). Real-time needs int ~1.2x AND render ~2x.
+- Wario Land (heavy): int≈45 ms (bottleneck; dynarec, memory-wall-capped
+  ~70%), render≈25 ms.
+Neither is full real-time yet; each needs substantial, *different* work
+(Tennis→renderer, Wario→dynarec). Feasibility is answered: the port runs
+real games correctly, simple content is close, but full-speed for these
+representative titles is a multi-week lift in two different subsystems.
+
+### 2026-05-29 — cheap renderer win measured: none; pixel composite is the floor
+
+Gated out the `SoftBufWrote` dirty-bounds bookkeeping on Playdate. Result:
+`render` unchanged (~49 ms title / ~25–29 ms gameplay). So that bookkeeping
+was negligible — **100% of `video_soft_render` is the per-pixel world/object
+compositing into the 2bpp framebuffer.** Cheap renderer wins are exhausted.
+The only big renderer lever left is the direct-to-1bpp rewrite (est. ~1.5–2x,
+multi-day, hard-fault risk). (Also observed: a later/heavier part of the
+Tennis demo pushes `int` to ~35 ms — the CPU isn't always near-budget even
+for a light game.)
+
+## CONSOLIDATED STATE (feasibility study substantially complete)
+
+**What works (on real hardware):** full V810 interpreter port; busywait
+detection (correct after the HALT-vs-poll fix); single-eye 1-bit renderer
+with cropping/threshold; input; ROM loading; runs Wario Land AND Mario's
+Tennis correctly. Dynarec substrate fully proven (RWX, Thumb-2 emitter,
+code cache, translator for moves/logic/arith+flags — all on-device tested).
+DTCM relocation infra built. Minor tolerable graphical glitches on scene
+changes.
+
+**Performance (both representative games, fixed-demo benchmark):**
+- Wario Land (CPU-heavy): int≈45 ms, render≈25 ms, tot≈72 ms (~14 fps).
+- Mario's Tennis (render-heavy/CPU-light): int≈22–35 ms, render≈25–50 ms,
+  tot≈52–74 ms (~14–19 fps).
+Both run in slow-motion (~30–40% speed); neither is real-time.
+
+**Why, and the remaining levers (both multi-week):**
+1. **CPU** (Wario, and Tennis's heavier moments): finish the Thumb-2 dynarec
+   (dispatcher + register allocation + CPSR flags + chaining; code cache in
+   DTCM). Realistic ~1.5–2x, memory-wall-capped near ~70% for Wario.
+2. **Renderer** (Tennis): rewrite the soft VIP to composite directly to
+   1-bit. Realistic ~1.5–2x.
+Real-time for a light game like Tennis needs BOTH (renderer ~2x to clear
+its 25–50 ms, AND CPU under the 20 ms/frame budget). So "plays like original
+hardware" for these titles is a genuine multi-week, two-subsystem effort;
+the memory wall makes the most demanding games (Wario) borderline even then.
+Simpler games than Tennis (fewer worlds/objects) are likely the sweet spot
+and may already be near real-time.
+
+**Bottom line for the feasibility question:** YES, red-viper's architecture
+ports cleanly and runs real VB games correctly on Playdate; partial-speed is
+achieved now; full real-time is reachable for light/simple games with
+substantial further renderer+CPU work, and is unlikely for the most
+demanding titles due to the SDRAM/cache memory wall.
+
 ## DYNAREC TRACK (user chose option 3: Thumb-2 backend)
 
 ### 2026-05-28 — step 1: RWX / cache-flush feasibility probe

@@ -46,17 +46,31 @@ extern void video_soft_render(int drawn_fb);
 #define THRESHOLD       2     // VB value >= threshold => Playdate white
 
 void pd_video_vip_step(PlaydateAPI *pd) {
-    (void)pd;
     if (!vb_state) return;
 
     int displayed_fb = vb_state->tVIPREG.tDisplayedFB & 1;
     int drawn_fb = tVBOpt.DOUBLE_BUFFER ? displayed_fb : 0;
 
     if (vb_state->tVIPREG.XPCTRL & XPEN) {
+        // Split-timing instrumentation: find where vip's cost goes (tile-cache
+        // rebuild vs world/object compositing) before optimising. ms-resolution
+        // is coarse but enough to see the dominant part. Logged every 60 frames.
+        unsigned t0 = pd->system->getCurrentTimeMilliseconds();
         if (tDSPCACHE.CharCacheInvalid) {
             update_texture_cache_soft();
         }
+        unsigned t1 = pd->system->getCurrentTimeMilliseconds();
         video_soft_render(drawn_fb);
+        unsigned t2 = pd->system->getCurrentTimeMilliseconds();
+
+        static unsigned acc_cache, acc_render, n;
+        acc_cache += (t1 - t0);
+        acc_render += (t2 - t1);
+        if (++n >= 60) {
+            pd->system->logToConsole("vipsplit: cache=%u render=%u ms (avg over %u)",
+                                     acc_cache / n, acc_render / n, n);
+            acc_cache = acc_render = n = 0;
+        }
 
         // The original renderer-driver in source/common/video.c clears these
         // after a render pass; we keep the same convention so subsequent
