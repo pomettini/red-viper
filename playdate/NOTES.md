@@ -854,3 +854,50 @@ cache in DTCM.
 
 **Recommendation:** stop tuning the interpreter (it's at its floor: gameplay
 ~15 fps, menus ~30 fps). Resume the dynarec; put its code cache in DTCM.
+
+### 2026-05-28 — dynarec step 3c done: arithmetic + flags (ARITH OK)
+
+Translator now covers, all validated on-device against hand-computed
+results AND flags:
+- moves: MOV, MOV_I, MOVEA, MOVHI (XLATE OK)
+- logic: OR/AND/XOR + ORI/ANDI/XORI, Z/S flags (LOGIC OK)
+- arithmetic: ADD/SUB/CMP + ADD_I/CMP_I/ADDI, full Z/S/OV/CY flags (ARITH OK)
+
+Flag approach: emit ARM flag-setting `adds`/`subs`, read APSR via `mrs`, and
+permute NZCV → V810 PSW (`ubfx` each bit into place), inverting the carry bit
+for subtraction (V810 CY = borrow = !ARM_C). Verified: `0-1` gives PSW low
+nibble `0xA` (S|CY) with upper bits preserved. This is the heavy-but-correct
+version (≈13 emitted instructions per arithmetic op); a CPSR-resident-flags
+optimisation is deferred to step 4.
+
+(Test-harness gotcha recorded: the self-tests used `ADD` as their
+"unsupported, stop here" sentinel; once ADD became a translated op the
+translator ran off the end of the test arrays. Switched the sentinel to
+`JMP`, which is genuinely unsupported. Not a translator bug.)
+
+## HONEST CHECKPOINT before the dispatcher (step 3d)
+
+The straight-line translator is complete and trustworthy. What remains for a
+*running* JIT — branch translation + the C dispatcher (cycle/event/interrupt
+model, block lookup/translate, interpreter fallback) — is the single largest
+and riskiest piece (a cycle bug faults mid-game), and it's where `int` first
+moves.
+
+Realistic payoff, stated plainly:
+- The current blocks are **memory-backed**: every operand is `ldr`/`str`ed
+  from the state struct, and each arithmetic op carries ~13 instructions
+  (heavy flag packing). A first integrated dispatcher will therefore be only
+  **marginally** faster than the interpreter — maybe a wash — until step 4
+  (register allocation: keep hot V810 regs in ARM r4–r10; CPSR-resident
+  flags; block chaining). Those are what made red-viper fast on 3DS.
+- The **memory wall caps the ceiling**: per the Beetle VB postmortem, even a
+  working Thumb-2 JIT hit ~28 ms warm / ~80 ms cold on this exact ROM. Our
+  interpreter is ~45 ms. So the realistic best case for Wario Land is
+  ~25–30 fps gameplay (not full-speed 50 fps), and cold-block translation
+  spikes will hurt unless the code cache is large and DTCM-resident.
+
+So the dynarec is worth pursuing only if the goal is to push *this* class of
+game from ~15 fps toward ~25–30 fps — a real improvement, but bounded. For
+"less demanding" games (the project's stated target), the interpreter is
+already adequate (~30 fps). This is the inflection point to decide how far to
+invest.
