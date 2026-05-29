@@ -575,3 +575,171 @@ to a Thumb-2 dynarec — but the cheap wins already took us 246 ms -> ~30 ms
 on menus and ~70–100 ms in gameplay, so simpler / "less demanding" games
 look reachable on the interpreter alone. Decide after the single-eye
 gameplay number lands.
+
+### 2026-05-28 — single-eye measured; cheap-win phase complete
+
+Single-eye render measured on device across menus + demo L1 + demo L2:
+- `vip` in gameplay: ~54 ms -> **~19–25 ms** (better than 2x: whole
+  right-eye-only worlds are skipped, and the FB clear is halved too).
+- Menus: `int≈22 vip≈6 tot≈30 ms` (~30 fps) — playable.
+- Demo L1 steady: `int≈38 vip≈19 tot≈58 ms` (~17 fps).
+- Demo L2 steady: `int≈42 vip≈25 tot≈68 ms` (~15 fps).
+- Scene transitions / heavy spots: `int` spikes 75–148 ms,
+  `tot` 90–160 ms (6–11 fps).
+- `blit` steady ~2 ms (negligible). `cy`≈400000/frame confirms one VB
+  frame per Playdate tick.
+
+**Cumulative result of the cheap-win phase (all on real hardware):**
+
+| build | menus tot | demo gameplay tot |
+|---|---|---|
+| initial            | —    | 246 ms (4 fps) |
+| blit fix           | —    | 128 ms |
+| fetch fast-path    | —    | 98 ms |
+| busywait detection | ~30 ms (30 fps) | 98 ms |
+| single-eye render  | ~30 ms (30 fps) | 58–71 ms (14–17 fps) |
+
+Render is now ~20 ms (down from a 121 ms naive blit + 54 ms both-eye
+raster). The interpreter is the entire remaining problem: ~40 ms steady,
+spiking to ~148 ms on transitions. The spikes are the Beetle VB
+postmortem's exact failure mode — cold instruction fetch thrashing the
+16 KB I-cache against the 2 MB ROM working set. A block-caching dynarec
+(translate once, run hot from I-cache, inline memory access, chain blocks)
+is precisely the fix for both the steady cost and the spikes.
+
+## ASSESSMENT CONCLUSION (answers the project's central question)
+
+**Can red-viper's architecture make VB emulation practical on Playdate?**
+
+- **Architecture ports cleanly.** The V810 core, memory map, software VIP
+  renderer, busywait detection, and timing model all compile and run on
+  Cortex-M7 with only the platform frontend rewritten. The 3DS sources are
+  reused near-verbatim via the `core/` symlinks; only ~5 small guarded
+  changes to shared files.
+- **red-viper's key speed techniques port and work:** busywait detection
+  (ported from the DRC into the interpreter) is a large, real win;
+  the dirty-cache software renderer works; single-eye + 1-bit threshold
+  is a clean fit for the Playdate panel.
+- **"Less demanding" content is already practical** on the pure
+  interpreter: menus, static/simple scenes, and low-world-count games run
+  at ~30 fps. A puzzle game or a homebrew title with modest VIP usage is
+  plausibly playable today.
+- **Mid-complexity gameplay (Wario Land) is ~15 fps** and not smooth on
+  the interpreter. The renderer is no longer the issue; the V810
+  interpreter is. red-viper hits full speed on 3DS *because of* its
+  dynarec, which we cannot reuse directly: it emits ARM A32, and Cortex-M7
+  is Thumb-2 only. A Thumb-2 backend is the remaining lever for full-speed
+  gameplay.
+
+**Difference from the Beetle VB outcome:** Beetle VB concluded the port was
+not viable (28–70 ms with a JIT, never real-time). We reach a more
+optimistic place: starting from a DRC-shaped emulator with busywait
+detection and a dirty-cache renderer, the *interpreter alone* already makes
+simple content playable, and the render path is solved. The same SDRAM
+working-set wall is visible (the `int` transition spikes), but the
+architecture has more headroom than Beetle VB's interpreter-first design.
+
+## REMAINING OPTIONS (the task's open dynarec questions)
+
+1. **Ship interpreter-only, scoped to less-demanding games.** Zero further
+   core work. Add frame-skip + a game-compat list. Honest about what runs.
+2. **More interpreter micro-opt** (decoded-block cache; WRAM/VRAM data-
+   access fast paths like the ROM fetch path). Bounded upside — maybe
+   15 fps -> ~20 fps in gameplay; will not reach 50 Hz.
+3. **Thumb-2 dynarec backend.** The real fix. Largest effort (rewrite of
+   `arm_emit`/`arm_codegen`/`drc_exec` for Thumb-2; needs an executable,
+   writable code region on Playdate + I/D cache maintenance via CMSIS —
+   `SCB_CleanDCache_by_Addr` / `SCB_InvalidateICache_by_Addr`). Open
+   sub-questions still to derisk: can a Playdate app get RWX memory at all,
+   and what's the per-block cache-flush cost? Keep the V810 decode/IR in
+   `drc_core.c`; only the emitter + dispatch stub are new.
+
+Recommendation: the assessment question is answered. Next concrete step is
+the user's strategic call between (1)/(2)/(3) — captured in the session
+log. Whichever path, the cheap-win phase is complete and well-measured.
+
+## DYNAREC TRACK (user chose option 3: Thumb-2 backend)
+
+### 2026-05-28 — step 1: RWX / cache-flush feasibility probe
+
+Before writing any emitter, prove generated Thumb-2 can execute on device
+and nail the cache-maintenance call. Probe generates `adds r0,#1; bx lr`,
+flushes, calls fn(5), expects 6.
+
+- **Attempt 1 (SCB registers): crashed.** Poking the Cortex-M7 SCB cache
+  registers directly (`SCB_DCCMVAC` @ 0xE000EF68) bus-faults — Playdate
+  apps run unprivileged. crashlog: `r1=e000ef68 cfsr=0x00000400`
+  (BFSR IMPRECISERR) at `pc=0x600016e2`.
+- **Two facts learned from the crash log:**
+  1. SCB cache-maintenance registers are off-limits to app code; need a
+     privilege-safe flush.
+  2. The app itself executes from SDRAM (`pc=0x600xxxxx`), so a
+     heap-allocated (SDRAM) code buffer is executable — execute-permission
+     is NOT a blocker for the dynarec.
+- **The SDK provides the right tool:** `pd->system->clearICache()` (SDK
+  2.0+), a firmware, privilege-safe D-clean + I-invalidate. This is almost
+  certainly how the Beetle VB JIT did it.
+- **Attempt 2 (clearICache + heap buffer): measurement pending.** Allocate
+  code via `pd->system->realloc`, write the two halfwords, `clearICache()`,
+  call with Thumb bit set. If it returns 6, the dynarec is fully viable:
+  heap = executable code cache, `clearICache()` = per-block flush.
+
+**Cache-flush cost note for later:** `clearICache()` appears to be a full
+I-cache clear (no by-range variant exposed), so calling it per translated
+block could be expensive. Plan: translate eagerly / batch, flush once after
+emitting a run of blocks, and minimise re-translation — exactly the
+"larger code cache, fewer flushes" lesson from the Beetle VB postmortem.
+
+### 2026-05-28 — step 1 result: RWX OK; step 2 result: EMITTER OK
+
+- **RWX OK.** `pd_jit_test` (clearICache + heap buffer) returned 6 from
+  generated `adds r0,#1; bx lr`. Generated Thumb-2 executes; the firmware
+  `clearICache()` is the correct, privilege-safe flush. All dynarec
+  blockers cleared.
+- **Thumb-2 emitter (`src/t2_emit.h`) validated on device, 3/3.** Encoders
+  for movw, movt, mov32 (movw+movt), add/sub/and/orr/eor (reg), cmp, mov
+  (reg), bx/blx, push/pop, ldr/str (imm offset). Self-test emitted three
+  functions (reg arithmetic; 32-bit immediate; ldr/sub/str memory) and all
+  returned correct results. Encoding layer — the highest-risk part — is
+  trustworthy.
+
+## DYNAREC ARCHITECTURE DECISION
+
+Two ways to build the Thumb-2 backend:
+
+- **(B) Port the 3DS `drc_core.c` wholesale, swapping its A32 `arm_emit.h`/
+  `arm_codegen.h` for Thumb-2 equivalents.** Reuses battle-tested block
+  decode, register allocation (V810 regs in r4–r10), PSW↔CPSR flag mapping,
+  busywait, branch opt. BUT the A32 emit layer leans on ARM-only mechanisms
+  — conditional execution via predication (Thumb-2 needs IT blocks),
+  `msr/mrs cpsr_f` in the `drc_exec.s` trampoline — so the port is fiddly,
+  and `drc_core.c` is tangled with 3DS includes (citro3d/video_hard).
+- **(A, CHOSEN) From-scratch minimal JIT.** Memory-backed V810 registers
+  (load operands from `v810_state.P_REG[]` into ARM scratch, compute, store
+  back — no register allocation yet), explicit flag computation in emitted
+  code (mirror the interpreter's Z/S/OV/CY math rather than mapping to ARM
+  CPSR), block = straight-line run until control flow or an unsupported op,
+  interpreter fallback for everything not yet translated. Grows op coverage
+  incrementally; every step verifiable on device.
+
+Rationale for (A): correctness is incremental and testable; avoids the IT-
+block / CPSR-trampoline complexity and the 3DS entanglement of (B). It will
+be slower than the 3DS register-allocated DRC at first (memory-backed regs,
+explicit flags), but it's a buildable path to *a* working JIT. Register
+allocation and native-flag use are later optimisations once it's correct
+and measured. If (A) plateaus below target, revisit (B) for the hot paths.
+
+**First op set (no flags, lowest risk):** MOV, MOV_I, MOVEA, MOVHI, and
+LD/ST/IN/OUT (loads/stores don't touch PSW). Control flow and any flag-
+setting op end the block and return to the C dispatcher, which services
+interrupts and runs unsupported ops via the interpreter, then resumes. This
+proves translate→chain→dispatch→fallback end-to-end before arithmetic +
+flag emission is added.
+
+### 2026-05-28 — step 2b: code cache + block cache (in progress)
+
+Building `src/pd_jit.{h,c}`: a heap code-cache buffer with a bump cursor
+and `clearICache()` flush, plus an open-addressed V810-PC -> code-pointer
+block map. Self-test extended to emit two distinct blocks into the cache
+and execute both, proving multi-block emission and the cursor/lookup before
+real translation is wired in.

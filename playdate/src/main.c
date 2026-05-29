@@ -11,6 +11,7 @@
 #include "pd_api.h"
 #include "pd_core.h"
 #include "pd_video.h"
+#include "pd_jit_test.h"
 
 #ifdef _WINDLL
 __declspec(dllexport)
@@ -49,6 +50,10 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
                 s_load_err = buf;
             }
         }
+
+        // Dynarec feasibility probe (device-only): confirm we can run
+        // generated Thumb-2 code before building the emitter.
+        pd_jit_test(pd);
 
         // 20 fps target (50 ms budget). See playdate/NOTES.md §5.
         pd->display->setRefreshRate(20.0f);

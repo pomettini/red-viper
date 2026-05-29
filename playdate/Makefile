@@ -28,6 +28,8 @@ SRC = \
 	src/pd_core.c \
 	src/pd_stubs.c \
 	src/pd_video.c \
+	src/pd_jit.c \
+	src/pd_jit_test.c \
 	core/v810_cpu.c \
 	core/v810_ins.c \
 	core/v810_mem.c \
