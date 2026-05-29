@@ -736,10 +736,121 @@ interrupts and runs unsupported ops via the interpreter, then resumes. This
 proves translate→chain→dispatch→fallback end-to-end before arithmetic +
 flag emission is added.
 
-### 2026-05-28 — step 2b: code cache + block cache (in progress)
+### 2026-05-28 — step 2b: code cache + block cache (CACHE OK)
 
-Building `src/pd_jit.{h,c}`: a heap code-cache buffer with a bump cursor
-and `clearICache()` flush, plus an open-addressed V810-PC -> code-pointer
-block map. Self-test extended to emit two distinct blocks into the cache
-and execute both, proving multi-block emission and the cursor/lookup before
-real translation is wired in.
+`src/pd_jit.{h,c}`: heap code-cache buffer with a bump cursor and
+`clearICache()` flush, plus an open-addressed V810-PC -> code-pointer block
+map. Self-test (t4) emitted two distinct blocks, looked them up, ran both,
+and confirmed an untranslated PC returns NULL. 3/3 CACHE OK on device.
+
+### 2026-05-28 — step 3a: move-subset translator (XLATE OK)
+
+`pd_jit_translate` walks a V810 instruction stream and emits Thumb-2 for
+MOV / MOV_I / MOVEA / MOVHI, stopping at the first unsupported opcode.
+Block ABI (so far): called as `void blk(uint32_t *p_reg)`, r0 = V810
+register-file base, r1/r2 scratch; reads of r0 emit a literal 0 (matching
+that the interpreter never reads P_REG[0]). Self-test (t5) translated a
+4-move program, stopped correctly at an ADD, ran it against a mock register
+file: r5=7, r6=7, r7=107, r8=0x12340000 all correct. 5/5 XLATE OK.
+
+## DYNAREC SUBSTRATE: FULLY PROVEN ON HARDWARE
+
+Everything that could have killed the approach is now validated on device:
+- RWX (heap executable) + `clearICache()` flush — RWX OK
+- Thumb-2 encoders (movw/movt/add/sub/and/orr/eor/cmp/ldr/str/bx/...) — EMITTER OK
+- code cache + PC->block map + multi-block emit/exec — CACHE OK
+- V810->Thumb-2 translation + execute + fallback boundary — XLATE OK
+
+What remains is additive translation work plus the live integration. None of
+it is high-uncertainty anymore; it's careful, individually-testable build-out.
+
+## REMAINING ROADMAP TO A GAMEPLAY WIN
+
+Important: none of the JIT affects the live `int` timing yet — the emulator
+is still 100% interpreter. The `int` numbers are unchanged because the
+dispatcher (step 3d) isn't wired in. A gameplay speedup needs the whole
+chain below, because the dispatcher is all-or-nothing for the runtime.
+
+- **3b — loads/stores.** Emit calls to the existing C mem helpers
+  (`mem_rword`/`mem_wword`/...). Introduces the block prologue/epilogue
+  (`push {r4,lr}; mov r4,r0` keep state in a callee-saved reg across the
+  `blx`; `pop {r4,pc}`) and AAPCS arg setup. Self-testable in isolation.
+- **3c — arithmetic + flags.** ADD/SUB/CMP/AND/OR/XOR/NOT/shifts with
+  correct V810 PSW (Z/S/OV/CY). **Flag-handling design decision (made):**
+  keep V810 PSW resident in the ARM condition flags (NZCV) across a block —
+  ARM ADDS/SUBS/ANDS set N,Z,C,V which map to V810 S,Z,CY,OV — and only
+  materialize PSW into the state struct at block exit or when an instruction
+  reads it. This is the proven 3DS-DRC approach and the only way to real
+  speed (per-op explicit flag packing would be correct but too slow). Needs
+  a few new encoders (ADDS/SUBS/ANDS, MRS/MSR APSR, BIC/ORR imm). Each
+  self-tested against the interpreter's exact flag results.
+- **3d — branches + dispatcher.** Translate conditional/uncond branches and
+  JMP/JR/JAL; build the C dispatcher that owns the cycle/event/interrupt
+  model (mirroring `interpreter_run`'s target/serviceInt loop), calls
+  translated blocks, and falls back to the interpreter for any
+  not-yet-translated op. Riskiest integration (a cycle/interrupt bug faults
+  mid-game); gated behind a flag so the interpreter build stays the safe
+  default. **This is the step where `int` finally moves.**
+- **4+ — optimisation.** Register allocation (map hot V810 regs to ARM
+  r4–r10 like the 3DS DRC instead of memory-backed), block chaining (jump
+  block→block without returning to the dispatcher), busywait in the JIT,
+  wider op coverage (MUL/DIV/BSTR/FPP), code-cache eviction policy. This is
+  where the JIT pulls meaningfully ahead of the interpreter.
+
+Status: substrate complete; ~4 more build-out steps to a measurable
+gameplay number, each individually testable on device. The hard unknowns
+are behind us — what's left is volume and careful correctness.
+
+## ITCM / DTCM EXPERIMENT (2026-05-28) — negative result, important
+
+Per the user's Beetle VB experience (ITCM was their single best lever),
+implemented the same technique for Red Viper:
+- Forked `link_map.ld` to add an `.itcm.rv` section (`__itcm_rv_start/end`).
+- `pd_itcm.c`: relocatable fast-path memory accessors (WRAM+ROM inline,
+  indirect-pointer fallback to mem_* for other regions), marked
+  `__attribute__((section(".itcm.rv")))`, built `-fno-jump-tables`.
+- Per frame: memcpy the 448-byte `.itcm.rv` region into a 32-byte-aligned
+  **stack buffer** (the Playdate stack is DTCM, zero-wait-state), `dsb`/`isb`,
+  repoint `g_rv_*` into the copy. Interpreter data accesses route through
+  `g_rv_*`. `relocate=1` confirmed on device.
+
+**Result: no measurable change to `int`.** Benchmarking note: only the
+**demo** segment is comparable across runs — it auto-plays with fixed length
+and content. The earlier menu/"precaution" phase is a manual, button-driven
+process that differs every run, so its numbers are NOT comparable build-to-
+build (don't read anything into them). The conclusion here rests on the
+fixed demo: **demo level 1 steady-state `int` was ~40 ms both before and
+after ITCM** — identical. That is the reliable signal.
+
+**Why it didn't transfer from Beetle VB:**
+1. **Our accessors were already I-cache-hot.** They're tiny (448 bytes,
+   called every instruction) and never get evicted, so pinning them in
+   DTCM removes a miss that wasn't happening. Beetle VB's mednafen core
+   funnels *all* memory through bigger bus callbacks (with banking logic)
+   that competed for I-cache — pinning those paid off; ours don't.
+2. **We'd already done the fetch fast-path.** `itrp_fetch` reads ROM
+   directly (inlined), so the hottest per-instruction memory op never even
+   calls an accessor. Little left for accessor-relocation to give.
+3. **The real cost is elsewhere and TCM-proof.** Red Viper's interpreter
+   cost is dominated by (a) the big `interpreter_run` dispatch loop (one
+   large function with a jump-table switch — can't be cleanly relocated)
+   and (b) **D-side SDRAM latency** reading the 2 MB ROM instruction stream
+   and WRAM/ROM operands. ITCM only accelerates *instruction* fetch of the
+   emulator's own code; the dominant data-side stalls on a 2 MB working set
+   don't fit any TCM (DTCM is ~64 KB, ~7.7 KB usable after RTOS). This is
+   the Beetle VB memory-latency wall, and TCM can't move it for an
+   interpreter over a 2 MB ROM.
+
+**Conclusion:** the ITCM/DTCM lever does not transfer to Red Viper's
+interpreter — architectural difference (inlined fetch + monolithic dispatch
+vs. callback-funnelled core) plus the un-TCM-able 2 MB working set. The
+infrastructure (linker section, per-frame DTCM relocation, pointer routing)
+is built and correct, and is kept because it has a natural home: **the JIT
+code cache.** Generated blocks are small, hot, self-contained, and
+relocatable — exactly the profile that benefits from zero-wait-state DTCM
+execution, and exactly what the Beetle VB JIT's "cold 80 ms" cliff needed.
+So the payoff for this work comes when the dynarec lands, with its code
+cache in DTCM.
+
+**Recommendation:** stop tuning the interpreter (it's at its floor: gameplay
+~15 fps, menus ~30 fps). Resume the dynarec; put its code cache in DTCM.

@@ -61,4 +61,16 @@ static inline uint32_t pd_jit_code_free(const jit_state *j) {
     return (uint32_t)((j->code_end - j->code_pos) * sizeof(uint16_t));
 }
 
+// Translate a run of V810 register-move instructions (MOV, MOV_I, MOVEA,
+// MOVHI) starting at start_pc, reading the V810 instruction stream from src
+// (halfword-addressed, native order). Stops at the first unsupported opcode
+// or after max_insns. Emits a block ending in `bx lr`; the block is called
+// as void blk(uint32_t *p_reg) with r0 = pointer to the 32-entry V810
+// general register file. Returns the callable entry (Thumb bit set) or NULL
+// on cache-full, and writes the number of V810 instructions translated to
+// *out_count. Does NOT flush the I-cache; caller batches and calls
+// pd_jit_flush before executing.
+void *pd_jit_translate(jit_state *j, const uint16_t *src, uint32_t start_pc,
+                       int max_insns, int *out_count);
+
 #endif // PD_JIT_H

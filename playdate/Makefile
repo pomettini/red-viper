@@ -28,6 +28,7 @@ SRC = \
 	src/pd_core.c \
 	src/pd_stubs.c \
 	src/pd_video.c \
+	src/pd_itcm.c \
 	src/pd_jit.c \
 	src/pd_jit_test.c \
 	core/v810_cpu.c \
@@ -51,6 +52,16 @@ ULIBDIR =
 ULIBS =
 
 include $(SDK)/C_API/buildsupport/common.mk
+
+# Use our forked linker script (adds the .itcm.rv section). LDFLAGS expands
+# LDSCRIPT lazily, so overriding it here applies to the device link. The
+# simulator build is a clang dylib and ignores the linker script entirely.
+LDSCRIPT := $(CURDIR)/link_map.ld
+
+# The relocated .itcm.rv functions must be position-independent under a raw
+# memcpy: no absolute jump tables (switch -> if/else), and they only call out
+# through function pointers (indirect), so no -mlong-calls needed.
+$(OBJDIR)/src/pd_itcm.o: CPFLAGS += -fno-jump-tables
 
 # ---------------------------------------------------------------------------
 # C++ support (Red Viper's video_soft.cpp uses two templates).

@@ -12,6 +12,7 @@
 #include "v810_cpu.h"
 #include "v810_mem.h"
 #include "rom_db.h"
+#include "pd_itcm.h"
 
 extern void apply_patches(void);
 
@@ -66,8 +67,10 @@ static void pd_apply_default_opts(void) {
 int pd_core_init(PlaydateAPI *pd) {
     pd_apply_default_opts();
     v810_init();
+    rv_itcm_init(); // route mem accessors through g_rv_* (default: plain mem_*)
     s_status.loaded = false;
-    pd->system->logToConsole("pd_core_init: V810 state buffers allocated");
+    pd->system->logToConsole("pd_core_init: V810 state buffers allocated; itcm region=%u bytes",
+                             (unsigned)rv_itcm_size());
     return 0;
 }
 
@@ -137,6 +140,19 @@ void pd_core_run_frame(PlaydateAPI *pd) {
     if (!s_status.loaded) return;
 
     pd_update_input(pd);
+
+    // Relocate the hot V810 memory accessors into a stack buffer (DTCM on
+    // device) for this frame, then run the whole frame within this scope so
+    // the buffer stays live and g_rv_* keep pointing into it. The 3DS-style
+    // technique from the Beetle VB port; no-op (returns 0) off-device.
+    uint8_t itcm_buf[4096] __attribute__((aligned(32)));
+    static int s_itcm_logged = 0;
+    int relocated = rv_itcm_relocate(itcm_buf, sizeof(itcm_buf));
+    if (!s_itcm_logged) {
+        s_itcm_logged = 1;
+        pd->system->logToConsole("pd_itcm: relocate=%d (region=%u bytes, buf=%u)",
+                                 relocated, (unsigned)rv_itcm_size(), (unsigned)sizeof(itcm_buf));
+    }
 
     uint32_t start_cycles = vb_state->v810_state.cycles;
     pd->system->resetElapsedTime();

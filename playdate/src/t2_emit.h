@@ -76,6 +76,25 @@ static inline void t2_and_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 
 static inline void t2_orr_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 0xEA40 | rn, (rd << 8) | rm); }
 static inline void t2_eor_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 0xEA80 | rn, (rd << 8) | rm); }
 
+// Flag-setting (S=1) variants of add/sub — set ARM N,Z,C,V.
+static inline void t2_adds_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 0xEB10 | rn, (rd << 8) | rm); }
+static inline void t2_subs_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 0xEBB0 | rn, (rd << 8) | rm); }
+
+// mrs Rd, APSR   T1: 1111 0011 1110 1111 | 1000 Rd 0000 0000
+static inline void t2_mrs_apsr(uint16_t **p, int rd) { t2_w32(p, 0xF3EF, 0x8000 | (rd << 8)); }
+
+// ubfx Rd,Rn,#lsb,#width   T1: 1111 0011 1100 Rn | 0 imm3 Rd imm2 (0) widthm1
+//   lsb = imm3:imm2
+static inline void t2_ubfx(uint16_t **p, int rd, int rn, int lsb, int width) {
+    uint16_t imm3 = (lsb >> 2) & 0x7, imm2 = lsb & 0x3;
+    t2_w32(p, 0xF3C0 | rn, (imm3 << 12) | (rd << 8) | (imm2 << 6) | ((width - 1) & 0x1F));
+}
+
+// eor Rd,Rn,#imm8 (modified immediate, simple imm8 path), T1: op=0100
+static inline void t2_eor_imm(uint16_t **p, int rd, int rn, uint8_t imm8) {
+    t2_w32(p, 0xF080 | rn, (rd << 8) | imm8);
+}
+
 // cmp Rn, Rm   T2: 1110 1011 1011 Rn | 0 imm3 1111 imm2 type Rm  (Rd=PC=15, S=1)
 static inline void t2_cmp_reg(uint16_t **p, int rn, int rm) { t2_w32(p, 0xEBB0 | rn, 0x0F00 | rm); }
 
@@ -86,6 +105,32 @@ static inline void t2_ldr_imm(uint16_t **p, int rt, int rn, uint16_t imm12) {
 // str Rt,[Rn,#imm12]   T3: 1111 1000 1100 Rn | Rt imm12
 static inline void t2_str_imm(uint16_t **p, int rt, int rn, uint16_t imm12) {
     t2_w32(p, 0xF8C0 | rn, (rt << 12) | (imm12 & 0xFFF));
+}
+
+// clz Rd,Rm   T1: 1111 1010 1011 Rm | 1111 Rd 1000 Rm   (Rm appears twice)
+static inline void t2_clz(uint16_t **p, int rd, int rm) {
+    t2_w32(p, 0xFAB0 | rm, 0xF080 | (rd << 8) | rm);
+}
+
+// MOV (shifted register) immediate amount, T2:
+//   hw1 = 1110 1010 0100 1111 (=0xEA4F, S=0, Rn=PC)
+//   hw2 = 0 imm3 Rd imm2 type Rm,  shift = imm3:imm2,  type: 00=LSL 01=LSR 10=ASR
+static inline void t2_shift_imm(uint16_t **p, int rd, int rm, int type, int sh) {
+    uint16_t imm3 = (sh >> 2) & 0x7, imm2 = sh & 0x3;
+    t2_w32(p, 0xEA4F, (imm3 << 12) | (rd << 8) | (imm2 << 6) | ((type & 3) << 4) | rm);
+}
+static inline void t2_lsl_imm(uint16_t **p, int rd, int rm, int sh) { t2_shift_imm(p, rd, rm, 0, sh); }
+static inline void t2_lsr_imm(uint16_t **p, int rd, int rm, int sh) { t2_shift_imm(p, rd, rm, 1, sh); }
+static inline void t2_asr_imm(uint16_t **p, int rd, int rm, int sh) { t2_shift_imm(p, rd, rm, 2, sh); }
+
+// Data-processing (modified immediate), S=0. Only the simple imm8 path
+// (i=0, imm3=0, value 0..255) is exposed — enough for small masks.
+//   hw1 = 1111 0 i 0 <op4> S nnnn ,  hw2 = 0 imm3 Rd imm8
+static inline void t2_bic_imm(uint16_t **p, int rd, int rn, uint8_t imm8) {
+    t2_w32(p, 0xF020 | rn, (rd << 8) | imm8); // op=0001 (BIC)
+}
+static inline void t2_orr_imm(uint16_t **p, int rd, int rn, uint8_t imm8) {
+    t2_w32(p, 0xF040 | rn, (rd << 8) | imm8); // op=0010 (ORR)
 }
 
 #endif // T2_EMIT_H
