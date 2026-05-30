@@ -26,7 +26,21 @@ static const char* SYSTEM_FONT_PATH =
 static LCDFont* s_font = NULL;
 static const char* s_load_err = NULL;
 
-static const char* ROM_PATH = "warioland.vb";
+static const char* ROM_PATH = "marios_tennis.vb";
+
+// Frame-skip "feel" mode, adjustable at runtime via the Playdate system menu
+// (the menu button, so it doesn't steal game input). The interpreter runs every
+// Playdate frame so VB game timing/logic stay correct; only the visible render
+// (VIP composite + blit) is skipped. For render-bound games this keeps the game
+// running at real speed while the screen updates less often. 0 = render every
+// frame; N = render every (N+1)th frame.
+static int s_render_skip = 0;
+static PDMenuItem* s_skip_item = NULL;
+
+static void skip_menu_cb(void* userdata) {
+    PlaydateAPI* pd = (PlaydateAPI*)userdata;
+    if (s_skip_item) s_render_skip = pd->system->getMenuItemValue(s_skip_item);
+}
 
 int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 {
@@ -60,6 +74,11 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
         // speed for no reason). Real game speed is still emulation-bound.
         pd->display->setRefreshRate(50.0f);
         pd->system->setUpdateCallback(update, pd);
+
+        // "Frame skip" feel-mode selector in the system menu (menu button).
+        static const char* skip_opts[] = { "Off", "Skip 1", "Skip 2", "Skip 3" };
+        s_skip_item = pd->system->addOptionsMenuItem(
+            "Frame skip", skip_opts, 4, skip_menu_cb, pd);
     }
 
     return 0;
@@ -71,14 +90,6 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 // window. logToConsole sent at ~1 Hz; even if it blocks briefly, only one
 // frame per second pays for it.
 #define LOG_INTERVAL 20
-
-// Render frame skip. RENDER_SKIP=0 renders every Playdate frame; =1 renders
-// every other; =2 every third; etc. The interpreter still runs every frame
-// so VB game timing stays correct; only the visible refresh slows.
-//
-// Full rendering for accurate per-frame profiling (real-time play needs
-// every frame rendered anyway). =1+ skips render frames for a feel test.
-#define RENDER_SKIP 0
 
 static struct {
     int     count;
@@ -120,7 +131,7 @@ static int update(void* userdata)
 
     static int s_skip_counter = 0;
     bool do_render = (s_skip_counter == 0);
-    s_skip_counter = (s_skip_counter + 1) % (RENDER_SKIP + 1);
+    s_skip_counter = (s_skip_counter + 1) % (s_render_skip + 1);
 
     unsigned int t_start = pd->system->getCurrentTimeMilliseconds();
 

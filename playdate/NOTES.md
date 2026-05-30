@@ -1206,6 +1206,20 @@ is the **interpreter + 1bpp renderer**; the renderer was the real, banked win
 (vip 25-45 ms → ~10 ms). Stage 5c (chaining) is NOT pursued: the measured wall
 makes its bounded payoff negative for this project's goals.
 
+## 2026-05-30 — Affine micro-opt: per-tile hoist gives only ~3% (it's per-pixel compute-bound)
+
+Hoisted the tilemap read, tile-flag decode and palette→bright table out of the
+affine per-pixel loop (recompute only when the affine walk crosses a tile, ~1/8
+of pixels). Correct (Tennis renders fine) but **only ~3% faster**: full-screen
+affine vip ~44 ms → ~43.5 ms, title logo ~11.8 → ~11.5. The hoisted reads were
+already cache-resident (a scene touches few tiles, so the tilemap line + the
+tile's 16-byte index data stay cached across an 8-pixel run) — we eliminated
+cache *hits*, not misses. The residual cost is per-pixel coordinate arithmetic +
+the index read + the masked write over ~86k px × 2 affine worlds — compute-bound
+and irreducible without drawing *less*. Kept the change (small real win, cleaner)
+but the lever for affine-heavy games is **frameskip** (skip whole frames for
+"feel"), or trading affine resolution for speed — not micro-opt.
+
 ## HONEST CHECKPOINT before the dispatcher (step 3d)
 
 The straight-line translator is complete and trustworthy. What remains for a

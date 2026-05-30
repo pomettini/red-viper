@@ -506,6 +506,17 @@ static void render_affine_world_1bpp(WORLD *world) {
     int gx = base_gx - gp;  // eye 0
     uint8_t *fb = pd_render_fb1;
 
+    // Per-tile cache: the affine walk steps sub-pixel, so consecutive pixels
+    // usually fall in the same tile. We recompute the (expensive) tilemap read,
+    // tile flags and palette→bright table only when tile_pos changes, leaving
+    // the per-pixel loop to do just coordinate math + one tile-data read + the
+    // write. bright[c] = does colour index c map (via this tile's palette) to a
+    // shade >= the white threshold; bright[0] stays 0 (index 0 is transparent).
+    int prev_tile_pos = -1;
+    int c_tileid = 0;
+    bool c_hflip = false, c_vflip = false;
+    uint8_t bright[4] = {0, 0, 0, 0};
+
     for (int y = 0; likely(y < h); y++) {
         if (unlikely(gy + y < 0)) continue;
         if (unlikely(gy + y >= 224)) break;
@@ -547,17 +558,23 @@ static void render_affine_world_1bpp(WORLD *world) {
                 int this_map = mapid + (xmap_ymap_masked >> 16) * scx + (xmap_ymap_masked & 0xffff);
                 tile_pos = this_map * 4096 + ty_scaled + tx;
             }
-            u16 tile = tilemap[tile_pos];
-            u16 tileid = tile & 0x07ff;
-            int palette = tile >> 14;
-            int px = tile & 0x2000 ? 7 - bpx : bpx;
-            int dpy = tile & 0x1000 ? (7 << 1) - dbpy : dbpy;
-            uint16_t tilecolumn = tileCache[tileid].indices.u16[px];
-            int pxindex = (tilecolumn >> dpy) & 3;
+            if (tile_pos != prev_tile_pos) {
+                prev_tile_pos = tile_pos;
+                u16 tile = tilemap[tile_pos];
+                c_tileid = tile & 0x07ff;
+                c_hflip = (tile & 0x2000) != 0;
+                c_vflip = (tile & 0x1000) != 0;
+                int pal = gplt[tile >> 14];
+                bright[1] = (uint8_t)(((pal >> 2) & 3) >= 2);
+                bright[2] = (uint8_t)(((pal >> 4) & 3) >= 2);
+                bright[3] = (uint8_t)(((pal >> 6) & 3) >= 2);
+            }
+            int px  = c_hflip ? 7 - bpx : bpx;
+            int dpy = c_vflip ? (7 << 1) - dbpy : dbpy;
+            int pxindex = (tileCache[c_tileid].indices.u16[px] >> dpy) & 3;
             if (pxindex) {
-                int pxvalue = (gplt[palette] >> (pxindex * 2)) & 3;
-                if (pxvalue >= 2) *out_word |= bit;
-                else              *out_word &= (uint8_t)~bit;
+                if (bright[pxindex]) *out_word |= bit;
+                else                 *out_word &= (uint8_t)~bit;
             }
             mx += dx;
             my += dy;
