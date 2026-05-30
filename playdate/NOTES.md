@@ -1240,6 +1240,33 @@ renders leaves the CPU running with a warmer cache. So frameskip helps twice —
 directly (less render) and indirectly (less cache pollution). This is the
 "feel" lever for render-heavy / affine games.
 
+## 2026-05-30 — BUSYWAIT DETECTOR FIX: RedSquare 9 → ~50 fps (a real win)
+
+RedSquare (homebrew) ran at ~9 fps with int ~98 ms, PC pinned in an 18-byte loop
+at ROM 0x7000fec. Decoding it (from the .vb, no device needed):
+```
+MOVEA r30,r0,#0xf800 ; MOVHI r30,r30,#6  -> r30 = 0x0005F800 (VIP INTPND)
+LD.H  r30,[r30+0]                          ; r30 = INTPND
+MOVEA r29,r0,#0x4000 ; AND r30,r29         ; test XPEND (drawing-done) bit
+BE    -> loop                               ; spin while clear
+```
+A classic VIP-sync idle spin — should be fast-forwarded, but the interpreter
+brute-forced ~400k cycles of it every frame. Cause: `busywait_body_ok` rejected
+any load with reg1==reg2 as a "pointer chase," but here r30 is *recomputed* each
+iteration (MOVEA+MOVHI) before the LD, so the self-addressed load is idempotent.
+
+Fix (source/common/interpreter.c): track which regs are (re)written earlier in
+the loop body; allow a self-addressed load only when its address reg was
+recomputed this iteration (fresh), still rejecting genuinely loop-carried
+pointer chases. Result on device: **int 98 → 4.4 ms, ~9 → ~45–50 fps**, correct
+(rendered 20/20, game advances). General: helps any title using the recompute-
+address-then-poll idiom. Strictly more permissive only in a provably-idempotent
+case, so low risk; worth a sanity re-check of a previously-good game.
+**Regression check (Wario Land, on device): PASSED** — int/vip unchanged vs the
+pre-fix baseline (~32 ms menu, ~48 ms L1, 60–132 ms L2, vip ~10 ms), played to
+level 2, no glitch/hang. Wario's int is genuine work (not a spin the fix
+touches), so correctly no change. Fix validated as safe across the board.
+
 ## 2026-05-30 — PER-GAME TEST RESULTS (interpreter + 1bpp renderer, on device)
 
 Measured on hardware with the shipping config (interpreter, 1bpp renderer,
@@ -1252,12 +1279,16 @@ and is useless-to-harmful for **CPU-bound** ones.
 |------|-----|-----------|----------|----------|----------------|-------------------|
 | **Galactic Pinball** | 1M | mixed: **light menus / render-heavy table** | 6 menus → ~22 table | 4–5 menus → 20–29 table | **~50 menus**, ~20–23 table | Helps the table (render-bound) |
 | **V-Tetris** | 512K | light menus / mild-CPU gameplay | 4.5–6 menus → ~22 play | 6 menus → 10–14 play | **~50 menus**, ~27–30 play | Skip 1 → ~36–40 play |
+| **Space Squash** | 512K | variable: light menus / **CPU-heavy combat** | 13 menus → 45–49 combat | 5 menus → 15–42 combat | **~50 menus**, ~15–20 combat | Helps render; combat CPU-floored ~20 |
+| **RedSquare** (homebrew) | 512K | **was CPU-bound (undetected spin) → fixed → render-bound** | 98 → **4.4** (after fix) | 11–21 | 9 → **~45–50** | n/a — now near full speed |
+| **Space Invaders** | 512K | **OUTLIER: pathological spikes** | 18 normal, **180–290 spikes** | 16 normal, **130 spike** | ~3–40 (unstable) | n/a — black-screen CPU phases |
 | **Mario's Tennis** | 512K | **render** (affine court) | 12–22 | 11–44 | ~16 (court) | **Big win** — Skip 2 → ~33–40 fps game-speed |
 | **Panic Bomber** | 512K | CPU (moderate) | 10 menu → 33–42 play | 2–18 | ~18–22 (busy) | Modest; capped by int |
 | **Wario Land** | 2M | CPU | 45 (L1) → 60–115 (L2) | ~10 | ~18 (L1) | Minor (removes ~10 ms render) |
 | **Mario Clash** | 1M | CPU | 70–90 | 6–12 (25 in FX scenes) | ~10–13 | Modest (more in FX scenes) |
 | **Jack Bros** | 1M | CPU + render-heavy scenes | 41–50 | 3–5 simple → 30–38 busy | ~12–22 | Helps busy scenes; CPU-floored ~20 |
-| **Teleroboxer** | 1M | **CPU (worst)** | **85–107** | 4–38 | ~8–11 | **Harmful** — slideshow, no speed gain |
+| **Teleroboxer** | 1M | **CPU (worst commercial)** | **85–107** | 4–38 | ~8–11 | **Harmful** — slideshow, no speed gain |
+| **Insecticide** (homebrew) | 2M | **CPU (worst overall, 3D engine)** | **96–122** | 4–40 | ~6–10 | n/a — CPU-bound |
 
 Per-game notes & what could help:
 - **Galactic Pinball** — **the breakthrough / best case.** Menus and simple
@@ -1277,6 +1308,23 @@ Per-game notes & what could help:
   it's CPU-bound. **Second confirmed fun game** after Mario's Tennis. Validates
   the goal: a less-demanding game made genuinely playable by 1bpp renderer +
   frameskip.
+- **Space Invaders** — problematic OUTLIER, not representative. Normal phases
+  ~25–40 fps, but hits two pathologies: (1) a heavy CPU routine at ROM
+  fff87e..–fff87fba that runs ~6× slower than typical code (int 180–290 ms for
+  ~400k real cycles — likely a tight loop of memory-mapped accesses / a CPU-side
+  buffer copy/clear going through the slow g_rv_* path, NOT fast-forwarded so the
+  interpreter brute-forces it); and (2) a renderer worst-case (vip ~130 ms in
+  some scene). Drawing is disabled (XPEN off, XP=1b00) during the CPU-spike
+  phases ⇒ black screen + "menus take seconds". Would need targeted profiling
+  (which region the hot routine hammers; what worlds the 130 ms render walks) to
+  explain/fix — a per-game compat issue, set aside.
+- **Space Squash** — 512K but action-heavy: menus/calm hit ~50 fps (int 13 ms),
+  yet sustained combat is CPU-bound (int ~45–49 ms ⇒ ~15–20 fps) with heavy
+  render too (vip 15–42 ms). Important: it **breaks the "ROM size predicts"
+  rule** — a 512K action game is as CPU-heavy in combat as the 1 MB titles. The
+  real driver is **per-frame CPU work / action intensity**, not ROM size (size
+  was only a loose proxy because bigger games tend to do more per frame).
+  Full-speed when idle, slow-mo exactly when the action peaks. Not fun in play.
 - **Mario's Tennis** — the 1bpp renderer made normal/object cheap; the affine
   court (~43 ms vip) is the wall. Affine micro-opt gained only ~3% (per-pixel
   compute-bound). *Lever:* frameskip (works well); a bigger win would be
@@ -1298,7 +1346,13 @@ Per-game notes & what could help:
   Frameskip removes the render half (helps busy scenes toward the ~20 fps CPU
   floor) but can't beat the int floor — stays slow-mo. Same bucket as
   Wario/Mario Clash; not a "fun" candidate.
-- **Teleroboxer** — heaviest CPU case: 1 MB ROM (largest working set → worst
+- **Insecticide** (homebrew) — 2 MB homebrew 3D/first-person engine; the heaviest
+  CPU case overall (int ~96–122 ms ⇒ ~6–10 fps): per-frame 3D math
+  (raycasting/polygons + FPU) on the V810. CPU-bound, frameskip can't help. Also
+  surfaced an input limitation — our mapping is only A/B/d-pad/(A+B=Start), no
+  Select or right d-pad, so couldn't progress (moot given the speed). Shows
+  homebrew that pushes 3D is as demanding as the worst commercial titles.
+- **Teleroboxer** — heaviest commercial CPU case: 1 MB ROM (largest working set → worst
   memory-wall behaviour) plus per-frame affine-parameter + likely heavy FPU math
   for the scaling fighters. ~10 fps and frameskip backfires (CPU-bound + low base
   fps → visual slideshow). *Lever:* none viable on this hardware; would need a
@@ -1322,6 +1376,11 @@ Per-game notes & what could help:
   helps materially.
 - Net: **practical for less-demanding games (the stated goal); not for the
   heaviest commercial titles at full speed.**
+- **Refinement (Space Squash):** the dominant factor is **per-frame CPU work /
+  action intensity**, not ROM size — a 512K action game can be as CPU-heavy in
+  combat (~48 ms) as the 1 MB titles. ROM size was only a loose proxy. So the
+  "playable" set is really *low-action* games (puzzle/board/pinball/menus),
+  regardless of size; busy action games are slow-mo whenever the action peaks.
 
 ## HONEST CHECKPOINT before the dispatcher (step 3d)
 

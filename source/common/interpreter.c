@@ -78,6 +78,13 @@ static bool get_cond(BYTE code, WORD psw) {
 
 static bool busywait_body_ok(WORD target_pc, WORD branch_pc) {
     WORD pc = target_pc;
+    // Bitmask of registers (re)computed earlier in this loop body. A load into
+    // its own address register (reg1==reg2) is idempotent IF that register was
+    // freshly computed this iteration (e.g. MOVEA+MOVHI of a fixed hardware
+    // address, then LD into it) — re-running just re-reads the same address.
+    // It's a real pointer chase (non-idempotent) only when the register is
+    // loop-carried, i.e. NOT rewritten before the load.
+    uint32_t written = 1; // r0 is constant 0, treat as always "fresh"
     while (pc < branch_pc) {
         HWORD instr = itrp_fetch(pc);
         BYTE opcode = instr >> 10;
@@ -87,9 +94,9 @@ static bool busywait_body_ok(WORD target_pc, WORD branch_pc) {
         switch (opcode) {
             case V810_OP_LD_B: case V810_OP_LD_H: case V810_OP_LD_W:
             case V810_OP_IN_B: case V810_OP_IN_H: case V810_OP_IN_W:
-                // a load into its own address register is a pointer chase,
-                // not idempotent
-                if (reg1 == reg2) return false;
+                // pointer chase only if the address reg is loop-carried (not
+                // recomputed earlier in the body)
+                if (reg1 == reg2 && !(written & (1u << reg1))) return false;
                 break;
             case V810_OP_MOV:  case V810_OP_MOV_I:
             case V810_OP_MOVEA: case V810_OP_MOVHI:
@@ -105,6 +112,9 @@ static bool busywait_body_ok(WORD target_pc, WORD branch_pc) {
             default:
                 return false;
         }
+        // Record reg2 as freshly computed (CMP/CMP_I are flags-only, no write).
+        if (opcode != V810_OP_CMP && opcode != V810_OP_CMP_I)
+            written |= (1u << reg2);
     }
     return true;
 }
