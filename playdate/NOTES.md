@@ -1251,10 +1251,12 @@ and is useless-to-harmful for **CPU-bound** ones.
 | Game | ROM | Bottleneck | int (ms) | vip (ms) | ~fps (no skip) | Frameskip verdict |
 |------|-----|-----------|----------|----------|----------------|-------------------|
 | **Galactic Pinball** | 1M | mixed: **light menus / render-heavy table** | 6 menus → ~22 table | 4–5 menus → 20–29 table | **~50 menus**, ~20–23 table | Helps the table (render-bound) |
+| **V-Tetris** | 512K | light menus / mild-CPU gameplay | 4.5–6 menus → ~22 play | 6 menus → 10–14 play | **~50 menus**, ~27–30 play | Skip 1 → ~36–40 play |
 | **Mario's Tennis** | 512K | **render** (affine court) | 12–22 | 11–44 | ~16 (court) | **Big win** — Skip 2 → ~33–40 fps game-speed |
 | **Panic Bomber** | 512K | CPU (moderate) | 10 menu → 33–42 play | 2–18 | ~18–22 (busy) | Modest; capped by int |
 | **Wario Land** | 2M | CPU | 45 (L1) → 60–115 (L2) | ~10 | ~18 (L1) | Minor (removes ~10 ms render) |
 | **Mario Clash** | 1M | CPU | 70–90 | 6–12 (25 in FX scenes) | ~10–13 | Modest (more in FX scenes) |
+| **Jack Bros** | 1M | CPU + render-heavy scenes | 41–50 | 3–5 simple → 30–38 busy | ~12–22 | Helps busy scenes; CPU-floored ~20 |
 | **Teleroboxer** | 1M | **CPU (worst)** | **85–107** | 4–38 | ~8–11 | **Harmful** — slideshow, no speed gain |
 
 Per-game notes & what could help:
@@ -1266,6 +1268,15 @@ Per-game notes & what could help:
   is ~20–23 fps and **render-bound** (so frameskip helps it, unlike the
   CPU-bound games). Validates the project goal: genuinely light games/scenes run
   at real speed.
+- **V-Tetris** — menus/light screens hit full 50 fps (int ~5 ms); main gameplay
+  is mildly CPU-bound (int ~22 ms, probably the stereoscopic-well animation) with
+  low render, so ~27–30 fps at Skip 0. **Skip 1 (confirmed on device): "plays
+  really good and is fun"** — ~44 fps game-speed. Notably int itself fell
+  22 → 17 ms at the same PC under Skip 1 (the cache-pollution bonus: less
+  rendering ⇒ warmer cache for the interpreter), so Skip 1 helps even though
+  it's CPU-bound. **Second confirmed fun game** after Mario's Tennis. Validates
+  the goal: a less-demanding game made genuinely playable by 1bpp renderer +
+  frameskip.
 - **Mario's Tennis** — the 1bpp renderer made normal/object cheap; the affine
   court (~43 ms vip) is the wall. Affine micro-opt gained only ~3% (per-pixel
   compute-bound). *Lever:* frameskip (works well); a bigger win would be
@@ -1282,6 +1293,11 @@ Per-game notes & what could help:
   frameskip helps more. A 1 MB ROM, so it lands between the 512K games and
   Teleroboxer — consistent with ROM size / working set driving CPU cost.
   *Lever:* none cheap; CPU/memory-wall bound.
+- **Jack Bros** — 1 MB action-puzzle; CPU-bound (int ~42–50 ms ⇒ ~20 fps
+  ceiling) AND render-heavy in busy/demo scenes (vip 30–38 ms), so ~12–22 fps.
+  Frameskip removes the render half (helps busy scenes toward the ~20 fps CPU
+  floor) but can't beat the int floor — stays slow-mo. Same bucket as
+  Wario/Mario Clash; not a "fun" candidate.
 - **Teleroboxer** — heaviest CPU case: 1 MB ROM (largest working set → worst
   memory-wall behaviour) plus per-frame affine-parameter + likely heavy FPU math
   for the scaling fighters. ~10 fps and frameskip backfires (CPU-bound + low base
