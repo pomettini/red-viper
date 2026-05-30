@@ -1220,6 +1220,26 @@ and irreducible without drawing *less*. Kept the change (small real win, cleaner
 but the lever for affine-heavy games is **frameskip** (skip whole frames for
 "feel"), or trading affine resolution for speed — not micro-opt.
 
+## 2026-05-30 — Frameskip "feel" mode (runtime, system menu) — works, with a cache bonus
+
+Added a runtime "Frame skip" selector to the Playdate system menu (Off/Skip
+1/2/3) via addOptionsMenuItem — doesn't steal game input. The interpreter runs
+every Playdate frame (VB timing/logic stay correct); only the VIP composite +
+blit are gated by a skip counter. The tile cache catches up on the next rendered
+frame, so skipping is visually-only and safe.
+
+Measured (Mario's Tennis): full-screen affine scene per-frame wall time
+~64 ms (Skip 0) → ~38 ms (Skip 1) → ~30 ms (Skip 2); court gameplay ~40 ms
+(Skip 1) → ~25 ms (Skip 2, ~40 fps). Game motion stays real-time; the screen
+just refreshes at 25/17/12 Hz.
+
+Unexpected bonus: at the SAME game location, `int` (CPU emulation) itself fell
+from ~28 ms (Skip 1) to ~18 ms (Skip 2) for identical VB cycles. Cause: the
+renderer evicts the interpreter's hot working set from the 16 KB cache; skipping
+renders leaves the CPU running with a warmer cache. So frameskip helps twice —
+directly (less render) and indirectly (less cache pollution). This is the
+"feel" lever for render-heavy / affine games.
+
 ## HONEST CHECKPOINT before the dispatcher (step 3d)
 
 The straight-line translator is complete and trustworthy. What remains for a
