@@ -1045,6 +1045,167 @@ Takeaways:
   bottleneck for Wario Land** — which is exactly what the dynarec (Option 3)
   targets. Proceeding there next.
 
+## 2026-05-30 — DYNAREC NEGATIVE RESULT: straight-line dispatcher is a 3–7× LOSS
+
+Built and measured step 3d in its smallest form: wire the existing straight-line
+translator into the live interpreter. Design (all gated behind `-DRV_JIT=1`):
+- New `pd_jit_block_for()` (lookup-or-translate, computes pc_bytes/cycles/last_op
+  metadata) + `pd_jit_run.c` global dispatcher (`rv_jit_init/_frame_flush/_try`).
+- Interpreter hook at the top of the loop: for ROM PCs, run a ready translated
+  block, advance PC/cycles by its totals, `continue`. Miss → translate for later.
+- I-cache coherence handled by a flush-generation counter: blocks become
+  executable only after the next per-frame `clearICache()` (batched, not
+  per-block). Stub blocks (pc_bytes==0) record "PC starts with a
+  non-translatable op" so we don't retry translating those.
+
+Result on device (Wario Land), **vs ~32 ms (menus) / ~45 ms (gameplay) for the
+pure interpreter**:
+- `int` = **130–200 ms steady**, with **spikes to 800–1600 ms** (translation
+  storms / block-map churn). A flat 3–7× regression. Correctness looked fine
+  (no crash, game advanced) — it's purely a performance catastrophe.
+
+Why (confirms the pre-dispatcher checkpoint, only worse):
+1. **Per-instruction lookup tax.** The hook does a hash+probe+call on *every*
+   ROM instruction. Most basic-block-start PCs are stubs (lead op is a
+   load/store/branch), so this tax is pure overhead with no offsetting block.
+2. **Translation thrashing.** Every newly reached PC translates a block or a
+   stub; the map fills and resets, re-translating en masse — the multi-hundred-ms
+   spikes.
+3. **Memory-backed blocks are slower than the C interpreter** per instruction:
+   every operand is ldr/str'd and each arith op carries ~13 instructions of
+   flag packing, vs the compiler-optimised interpreter switch.
+
+**Decision: RV_JIT disabled** (Makefile UDEFS), reverting to the pure
+interpreter (the good post-renderer numbers). The JIT code stays compiled and
+self-tested in the tree as proven substrate, but is not in the hot loop.
+
+What it would actually take to win (and the ceiling):
+- A straight-line dispatcher fundamentally can't pay for itself. A real win
+  needs the full red-viper-style backend: **basic-block translation** (branches
+  + loads/stores inline, so blocks span real BBs and the per-instruction tax
+  amortises), **register allocation** (hot V810 regs resident in ARM r4–r10),
+  **CPSR-resident flags** (drop the ~13-instruction packing), and **block
+  chaining** (eliminate per-block lookups). That is a multi-week effort.
+- Even done well, the **memory wall caps it**: the Beetle VB postmortem's
+  working Thumb-2 JIT hit ~28 ms warm / ~80 ms cold on *this* ROM. So the
+  realistic ceiling for Wario Land is ~25–30 fps gameplay, not 50.
+
+So the dynarec is a large, bounded-payoff investment. For the project's stated
+target — *less demanding games* — the **pure interpreter + 1bpp renderer is the
+better-value configuration today** (Wario ~18 fps gameplay; lighter games
+faster). Recommend treating heavy-game full-speed as out of scope unless the
+full register-allocating backend is explicitly desired.
+
+## 2026-05-30 — FULL BACKEND committed; Stage 1 (register allocation + lazy flags) DONE
+
+After the straight-line dispatcher proved a loss, the decision was to build the
+real red-viper-style backend. Staged, each validated by the boot self-test
+harness (pd_jit_test.c) BEFORE any game integration, so we never ship a broken
+hot loop again:
+- **Stage 1 (done):** register-allocating, lazy-flag translator
+  (`pd_jit_translate_ra`). V810 operands resident in ARM r4–r10 (loaded once,
+  stored once); r11=base, r3=0, r0–r2/r12 scratch. Every flag op leaves ARM
+  CPSR set (adds/subs/ands/orrs/eors); PSW materialised exactly once in the
+  epilogue (only the last flag op is observable in a straight-line block).
+  Prologue `push {r4-r11,lr}` / epilogue `pop {r4-r11,pc}` (needs the wide
+  PUSH.W/POP.W encoders added to t2_emit.h). **t9 self-test: RA OK 7/7** on
+  device (covers reuse, in-place ops, MOVEA 32-bit imm, lazy ADD/SUB/logic
+  flags) — results match the interpreter exactly.
+- **Stage 2 (next):** translate loads/stores by calling the g_rv_* accessors;
+  pooled regs in r4–r10 survive the calls (callee-saved), so blocks can span
+  loads/stores. This is the first stage that lets blocks cover whole basic
+  blocks — the prerequisite for the per-block dispatch model to pay off.
+- **Stage 3:** branch-terminated basic blocks + next-PC computation.
+- **Stage 4:** block-level dispatch loop + cycle/event model + interpreter
+  fallback (the riskiest piece).
+- **Stage 5:** block chaining; integrate behind RV_JIT and measure vs the
+  interpreter.
+
+Note: only after Stage 4/5 does anything change in-game; Stages 1–3 are
+validated in isolation. The realistic ceiling remains ~25–30 fps for Wario-class
+games (memory wall). RV_JIT stays OFF in UDEFS until Stage 5 integration.
+
+## 2026-05-30 — BASIC-BLOCK BACKEND: correct on real game, but ~3x slower (needs chaining)
+
+Stages 1-4 of the real backend are built and the whole thing is wired into the
+live interpreter behind RV_JIT. All translator self-tests pass on device
+(t9 RA OK, t10 LS OK, t11 BRANCH OK), and — the big milestone — **it runs Wario
+Land correctly**: no garbage, no freezes, correct behaviour through multiple
+levels. The translator (register allocation in ARM r4-r10, lazy flags via CPSR,
+load/store via the g_rv_* accessors, Bcond/JR/JAL/JMP with PSW condition eval and
+next-PC return) and the dispatch+event integration are all proven on commercial
+game code. That was the hard, risky part and it works.
+
+Integration design (low-risk): the dispatcher is a hook at the top of the
+interpreter loop (not a separate engine), so it reuses the interpreter's proven
+event/interrupt/HALT/serviceInt machinery. A ready block runs a whole basic
+block natively and returns the next PC; the loop advances cycles by the block's
+opcycle sum and `continue`s. Busy-wait loops spin natively and exit when
+serviceInt advances the event between blocks (no fast-forward needed). HALT and
+other system ops stay in the interpreter (stub block ⇒ dispatch miss).
+
+**Performance: a loss.** Wario Land `int` ≈ 130-140 ms steady (early frames
+210-400 ms during translation warmup), vs ~45 ms for the pure interpreter — about
+3x slower. Why: VB basic blocks are short (~5 instructions), and every block pays
+unamortised fixed overhead:
+- prologue/epilogue register save/restore on every block,
+- a flag pack to PSW that the terminating branch then immediately re-reads
+  (redundant on the hot compare-and-branch pattern),
+- a per-block dispatch hash lookup,
+- I-cache thrash: the 256 KB SDRAM code buffer vs the 16 KB I-cache.
+
+Only **block chaining (Stage 5)** amortises this: patch block→block jumps so hot
+loops stay in native code with registers live across blocks and no dispatcher
+round-trip, plus evaluate branch conditions straight from CPSR (skip the
+pack+reload) and save/restore only the callee-saved regs a block actually uses.
+That is another large, multi-session effort.
+
+**Honest ceiling reminder.** The Beetle VB postmortem's *working* Thumb-2 JIT hit
+~28 ms warm / ~80 ms cold on this exact ROM. So even a fully chained backend
+realistically lands around match-or-modestly-beat the ~45 ms interpreter for
+Wario-class games — the memory wall dominates, not dispatch overhead. The big,
+already-banked win was the renderer (vip 25-45 ms → ~10 ms). For the project's
+stated target (less-demanding games) the **interpreter + 1bpp renderer remains
+the pragmatic sweet spot**; the dynarec is correct and kept in-tree (gated off)
+as proven substrate, but its perf payoff for this hardware is bounded and not yet
+positive without Stage 5.
+
+RV_JIT is OFF in UDEFS. Re-enable with `-DRV_JIT=1` + `make clean` to A/B it.
+
+### 2026-05-30 — Stage 5a measured: dynarec is MEMORY-BOUND (the decisive finding)
+
+Added minimal register-save (push/pop only the pool regs a block uses) and
+per-frame JIT diagnostics, then measured Wario Land on device. The diagnostics
+settle the question of where the dynarec's time goes:
+- Steady state: **xlate ≈ 9 / 60 frames** (essentially no translation — not
+  churn), **blocks ≈ 1300** of 16384 (no map thrashing), **exec ≈ 2.5M / 60f ≈
+  42,000 block executions per frame**.
+- int ≈ 186 ms ⇒ **~4.4 µs ≈ ~780 ARM cycles per ~5-instruction basic block.**
+
+780 cycles for 5 instructions is pure **memory stall**, not compute: the
+translated code lives in the 256 KB SDRAM code buffer and thrashes the 16 KB
+I-cache; the dispatcher's hash probe hits a 384 KB block-map array (more misses);
+register spill/fill hits cpu_state in SDRAM. Minimal reg-save barely moved int —
+confirming the cost isn't the instructions we emit, it's fetching them.
+
+Why this is decisive (not just "needs more optimisation"):
+- The interpreter wins *because* its hot loop is small and stays resident in the
+  16 KB I-cache; only the ROM instruction stream misses. The JIT's code is larger
+  and scattered, so it I-cache-misses on essentially every block.
+- Block chaining would remove the dispatcher round-trip (~half the overhead →
+  ~90 ms?), but **still wouldn't beat the 45 ms interpreter**, and can't fix the
+  I-cache pressure of SDRAM-resident code.
+- There is no fast memory to escape to: DTCM/ITCM (~7.7 KB free) can't hold a
+  meaningful working set of translated code.
+
+**Conclusion: the dynarec cannot beat the interpreter on Playdate hardware.**
+This reproduces, with on-device measurements, the Beetle VB postmortem's core
+finding. The backend is complete and correct (kept in-tree, gated off, fully
+self-tested) but is the wrong lever for this hardware. The winning configuration
+is the **interpreter + 1bpp renderer**; the renderer was the real, banked win
+(vip 25-45 ms → ~10 ms). Stage 5c (chaining) is NOT pursued: the measured wall
+makes its bounded payoff negative for this project's goals.
+
 ## HONEST CHECKPOINT before the dispatcher (step 3d)
 
 The straight-line translator is complete and trustworthy. What remains for a

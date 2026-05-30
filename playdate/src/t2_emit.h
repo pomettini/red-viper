@@ -34,6 +34,14 @@ static inline void t2_push(uint16_t **p, uint16_t list) { t2_hw(p, 0xB400 | list
 // pop  list    T1: 1011 110 P rrrrrrrr   (bit8=P=pc,  bits0-7=r0..r7)
 static inline void t2_pop(uint16_t **p, uint16_t list) { t2_hw(p, 0xBC00 | list); }
 
+// push.w/pop.w with a full register-list (T2 STMDB/LDMIA sp!). Needed to save
+// the callee-saved r8-r11 used by the register allocator. `list` is a 16-bit
+// bitmap: bit n = register n; bit14 = lr (push), bit15 = pc (pop).
+//   STMDB sp! : 1110 1001 0010 1101 | list      (Rn=sp, W=1)
+//   LDMIA sp! : 1110 1000 1011 1101 | list
+static inline void t2_push_w(uint16_t **p, uint16_t list) { t2_w32(p, 0xE92D, list); }
+static inline void t2_pop_w(uint16_t **p, uint16_t list)  { t2_w32(p, 0xE8BD, list); }
+
 // mov Rd, Rm   T1 (any reg): 0100 0110 D Rm(4) Rd(3)
 static inline void t2_mov_reg(uint16_t **p, int rd, int rm) {
     t2_hw(p, 0x4600 | ((rd & 8) << 4) | (rm << 3) | (rd & 7));
@@ -80,6 +88,13 @@ static inline void t2_eor_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 
 static inline void t2_adds_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 0xEB10 | rn, (rd << 8) | rm); }
 static inline void t2_subs_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 0xEBB0 | rn, (rd << 8) | rm); }
 
+// Flag-setting (S=1) variants of the logic ops — set ARM N,Z (V unchanged, C
+// from the shifter = unchanged for an unshifted register). The lazy-flag
+// epilogue derives V810 Z/S from these.
+static inline void t2_ands_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 0xEA10 | rn, (rd << 8) | rm); }
+static inline void t2_orrs_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 0xEA50 | rn, (rd << 8) | rm); }
+static inline void t2_eors_reg(uint16_t **p, int rd, int rn, int rm) { t2_w32(p, 0xEA90 | rn, (rd << 8) | rm); }
+
 // mrs Rd, APSR   T1: 1111 0011 1110 1111 | 1000 Rd 0000 0000
 static inline void t2_mrs_apsr(uint16_t **p, int rd) { t2_w32(p, 0xF3EF, 0x8000 | (rd << 8)); }
 
@@ -111,6 +126,14 @@ static inline void t2_str_imm(uint16_t **p, int rt, int rn, uint16_t imm12) {
 static inline void t2_clz(uint16_t **p, int rd, int rm) {
     t2_w32(p, 0xFAB0 | rm, 0xF080 | (rd << 8) | rm);
 }
+
+// Sign/zero-extend byte/halfword (T2, 32-bit so Rd/Rm may be r0..r12; rot=0).
+//   hw1 = 1111 1010 0 <op> 1111 ,  hw2 = 1111 Rd 1000 Rm
+//   op: SXTH=000 UXTH=001 SXTB=010 UXTB=011  -> hw1 = 0xFA0F/1F/4F/5F
+static inline void t2_sxth(uint16_t **p, int rd, int rm) { t2_w32(p, 0xFA0F, 0xF080 | (rd << 8) | rm); }
+static inline void t2_uxth(uint16_t **p, int rd, int rm) { t2_w32(p, 0xFA1F, 0xF080 | (rd << 8) | rm); }
+static inline void t2_sxtb(uint16_t **p, int rd, int rm) { t2_w32(p, 0xFA4F, 0xF080 | (rd << 8) | rm); }
+static inline void t2_uxtb(uint16_t **p, int rd, int rm) { t2_w32(p, 0xFA5F, 0xF080 | (rd << 8) | rm); }
 
 // MOV (shifted register) immediate amount, T2:
 //   hw1 = 1110 1010 0100 1111 (=0xEA4F, S=0, Rn=PC)

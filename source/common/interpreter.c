@@ -10,6 +10,9 @@
 // Everywhere else they call the plain mem_* functions directly.
 #if defined(TARGET_PLAYDATE) || defined(TARGET_SIMULATOR)
 #include "pd_itcm.h"
+#ifdef RV_JIT
+#include "pd_jit_run.h"
+#endif
 #else
 #define MEM_RBYTE   mem_rbyte
 #define MEM_RHWORD  mem_rhword
@@ -137,6 +140,25 @@ int interpreter_run(void) {
             }
             target = cycles + vb_state->v810_state.cycles_until_event_partial;
         }
+#ifdef RV_JIT
+        // Run a translated basic block (ROM only): it executes the whole block
+        // natively and returns the next V810 PC. We advance cycles by the
+        // block's cost and re-enter the loop, which re-checks events/interrupts
+        // with the existing machinery. A miss means no ready block — interpret
+        // this instruction (and translate the block for next frame).
+        if ((PC & 0x07000000) == 0x07000000) {
+            uint32_t cyc_adv;
+            BYTE jit_lastop;
+            uint32_t npc = rv_jit_dispatch(PC, &cyc_adv, &jit_lastop);
+            if (npc != RV_JIT_MISS) {
+                cycles += cyc_adv;
+                last_opcode = jit_lastop;
+                PC = npc;
+                last_PC = PC;
+                continue;
+            }
+        }
+#endif
         HWORD instr = itrp_fetch(PC);
         PC += 2;
         BYTE opcode = instr >> 10;

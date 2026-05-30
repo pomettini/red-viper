@@ -13,6 +13,9 @@
 #include "v810_mem.h"
 #include "rom_db.h"
 #include "pd_itcm.h"
+#ifdef RV_JIT
+#include "pd_jit_run.h"
+#endif
 
 extern void apply_patches(void);
 
@@ -68,6 +71,9 @@ int pd_core_init(PlaydateAPI *pd) {
     pd_apply_default_opts();
     v810_init();
     rv_itcm_init(); // route mem accessors through g_rv_* (default: plain mem_*)
+#ifdef RV_JIT
+    rv_jit_init(pd);
+#endif
     s_status.loaded = false;
     pd->system->logToConsole("pd_core_init: V810 state buffers allocated; itcm region=%u bytes",
                              (unsigned)rv_itcm_size());
@@ -140,6 +146,12 @@ void pd_core_run_frame(PlaydateAPI *pd) {
     if (!s_status.loaded) return;
 
     pd_update_input(pd);
+
+#ifdef RV_JIT
+    // Make blocks translated during the previous frame executable (batched
+    // I-cache flush). Must precede v810_run so this frame can run them.
+    rv_jit_frame_flush();
+#endif
 
     // Relocate the hot V810 memory accessors into a stack buffer (DTCM on
     // device) for this frame, then run the whole frame within this scope so

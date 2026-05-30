@@ -20,6 +20,7 @@
 
 #include "t2_emit.h"
 #include "pd_jit.h"
+#include "pd_itcm.h"   // g_rv_* accessors, for the load/store round-trip test
 
 typedef int  (*fn_i_i)(int);
 typedef void (*fn_v_p)(int *);
@@ -281,6 +282,193 @@ void pd_jit_test(PlaydateAPI *pd) {
 
         pd->system->logToConsole("pd_jit_test: arith self-test %d/%d -> %s",
                                  apass, atotal, apass == atotal ? "ARITH OK" : "ARITH FAIL");
+        pd_jit_free(&j);
+    }
+
+    // --- test 9: register-allocating / lazy-flag translator (Stage 1) ---
+    {
+        jit_state j;
+        if (!pd_jit_init(&j, pd, 4096, 64)) {
+            pd->system->logToConsole("pd_jit_test: jit init (RA) failed");
+            return;
+        }
+        //   MOV_I r5,#-1       ; 0xFFFFFFFF
+        //   MOV_I r6,#1
+        //   ADD   r5,r6        ; r5 = 0            (intermediate flags, discarded)
+        //   MOV   r7,r5        ; r7 = 0            (reg-reg move; reuse of r5)
+        //   MOVEA r8,r6,#10    ; r8 = r6 + 10 = 11 (32-bit imm; reuse of r6)
+        //   OR    r8,r5        ; r8 = 11 | 0 = 11  (logic flags, discarded)
+        //   SUB   r9,r6        ; r9 = 0 - 1 = -1   (final flags: S=1,CY=1 -> 0xA)
+        //   JMP               ; stop
+        static const uint16_t prog[] = {
+            0x40BF, 0x40C1, 0x04A6,
+            0x00E5,
+            0xA106, 0x000A,
+            0x3105,
+            0x0926,
+            0x5000,  // unsupported op (shift) -> stop
+        };
+        int count = 0;
+        void *entry = pd_jit_translate_ra(&j, prog, 0x07000000, 32, &count);
+        pd_jit_flush(&j);
+
+        int rpass = 0, rtotal = 0;
+        rtotal++; if (count == 7) rpass++;
+        pd->system->logToConsole("  t9 translated %d insns (exp 7) %s", count, count == 7 ? "ok" : "BAD");
+
+        if (entry) {
+            uint32_t reg[64];
+            memset(reg, 0, sizeof(reg));
+            reg[37] = 0xF0; // PSW preset; upper bits must survive
+            ((void (*)(uint32_t *))entry)(reg);
+            struct { int idx; uint32_t exp; const char *nm; } chk[] = {
+                {5,  0x00000000, "r5"},
+                {6,  0x00000001, "r6"},
+                {7,  0x00000000, "r7"},
+                {8,  0x0000000B, "r8"},
+                {9,  0xFFFFFFFF, "r9"},
+                {37, 0xFA,       "PSW(S|CY)"},  // (0xF0 & ~0xf) | 0xA
+            };
+            for (int k = 0; k < 6; k++) {
+                rtotal++;
+                int good = reg[chk[k].idx] == chk[k].exp;
+                if (good) rpass++;
+                pd->system->logToConsole("  t9 %s=0x%x exp 0x%x %s",
+                                         chk[k].nm, (unsigned)reg[chk[k].idx],
+                                         (unsigned)chk[k].exp, good ? "ok" : "BAD");
+            }
+        }
+
+        pd->system->logToConsole("pd_jit_test: RA self-test %d/%d -> %s",
+                                 rpass, rtotal, rpass == rtotal ? "RA OK" : "RA FAIL");
+        pd_jit_free(&j);
+    }
+
+    // --- test 10: loads/stores via g_rv_* (Stage 2) ---
+    // Round-trips values through real WRAM (0x05000000). Saves and restores the
+    // two words we touch so the game still boots cleanly afterwards.
+    {
+        jit_state j;
+        if (!pd_jit_init(&j, pd, 4096, 64)) {
+            pd->system->logToConsole("pd_jit_test: jit init (LS) failed");
+            return;
+        }
+        uint32_t save0 = (uint32_t)g_rv_rword(0x05000000);
+        uint32_t save4 = (uint32_t)g_rv_rword(0x05000004);
+
+        //   MOVHI r5,r0,#0x0500   ; r5 = 0x05000000 (WRAM)
+        //   MOVEA r6,r0,#0x1234   ; r6 = 0x1234
+        //   ST_W  [r5+0],r6       ; mem[..0] = 0x1234
+        //   MOV_I r7,#0           ; clobber r7
+        //   LD_W  r7,[r5+0]       ; r7 = 0x1234
+        //   MOVEA r8,r0,#0x00FF   ; r8 = 0xFF
+        //   ST_B  [r5+4],r8       ; mem[..4] = 0xFF
+        //   LD_B  r9,[r5+4]       ; r9 = (SBYTE)0xFF = 0xFFFFFFFF
+        //   IN_B  r10,[r5+4]      ; r10 = (BYTE)0xFF  = 0x000000FF
+        //   JMP                   ; stop
+        static const uint16_t prog[] = {
+            0xBCA0, 0x0500,
+            0xA0C0, 0x1234,
+            0xDCC5, 0x0000,
+            0x40E0,
+            0xCCE5, 0x0000,
+            0xA100, 0x00FF,
+            0xD105, 0x0004,
+            0xC125, 0x0004,
+            0xE145, 0x0004,
+            0x5000,  // unsupported op (shift) -> stop
+        };
+        int count = 0;
+        void *entry = pd_jit_translate_ra(&j, prog, 0x07000000, 32, &count);
+        pd_jit_flush(&j);
+
+        int lpass = 0, ltotal = 0;
+        ltotal++; if (count == 9) lpass++;
+        pd->system->logToConsole("  t10 translated %d insns (exp 9) %s", count, count == 9 ? "ok" : "BAD");
+
+        if (entry) {
+            uint32_t reg[64];
+            memset(reg, 0, sizeof(reg));
+            ((void (*)(uint32_t *))entry)(reg);
+            struct { int idx; uint32_t exp; const char *nm; } chk[] = {
+                {7,  0x00001234, "r7(LD_W)"},
+                {9,  0xFFFFFFFF, "r9(LD_B)"},
+                {10, 0x000000FF, "r10(IN_B)"},
+            };
+            for (int k = 0; k < 3; k++) {
+                ltotal++;
+                int good = reg[chk[k].idx] == chk[k].exp;
+                if (good) lpass++;
+                pd->system->logToConsole("  t10 %s=0x%x exp 0x%x %s",
+                                         chk[k].nm, (unsigned)reg[chk[k].idx],
+                                         (unsigned)chk[k].exp, good ? "ok" : "BAD");
+            }
+        }
+
+        // Restore the WRAM we clobbered.
+        g_rv_wword(0x05000000, save0);
+        g_rv_wword(0x05000004, save4);
+
+        pd->system->logToConsole("pd_jit_test: load/store self-test %d/%d -> %s",
+                                 lpass, ltotal, lpass == ltotal ? "LS OK" : "LS FAIL");
+        pd_jit_free(&j);
+    }
+
+    // --- test 11: branch-terminated blocks return the next PC (Stage 3) ---
+    {
+        jit_state j;
+        if (!pd_jit_init(&j, pd, 8192, 64)) {
+            pd->system->logToConsole("pd_jit_test: jit init (branch) failed");
+            return;
+        }
+        int bpass = 0, btotal = 0;
+
+        // A) BE taken (Z=1): MOV_I r5,#0; CMP r5,r5; BE +0x10
+        static const uint16_t pA[] = { 0x40A0, 0x0CA5, 0x8410 };
+        // B) BE not taken (Z=0): MOV_I r5,#1; CMP r5,r0; BE +0x10
+        static const uint16_t pB[] = { 0x40A1, 0x0CA0, 0x8410 };
+        // C) BR +0x20 (unconditional)
+        static const uint16_t pC[] = { 0x8A20 };
+        // D) MOVEA r5,r0,#0x42; JMP r5
+        static const uint16_t pD[] = { 0xA0A0, 0x0042, 0x1805 };
+        // E) JAL +0x40  (r31 = branch+4, PC = branch+0x40)
+        static const uint16_t pE[] = { 0xAC00, 0x0040 };
+
+        struct { const uint16_t *p; uint32_t pc, exp; const char *nm; } cs[] = {
+            { pA, 0x07000000, 0x07000014, "BE taken"     },
+            { pB, 0x07000100, 0x07000106, "BE not taken" },
+            { pC, 0x07000200, 0x07000220, "BR"           },
+            { pD, 0x07000300, 0x00000042, "JMP r5"       },
+            { pE, 0x07000400, 0x07000440, "JAL"          },
+        };
+        for (int k = 0; k < 5; k++) {
+            int count = 0;
+            void *e = pd_jit_translate_ra(&j, cs[k].p, cs[k].pc, 16, &count);
+            pd_jit_flush(&j);
+            btotal++;
+            if (e) {
+                uint32_t reg[64];
+                memset(reg, 0, sizeof(reg));
+                uint32_t nextpc = ((uint32_t (*)(uint32_t *))e)(reg);
+                int good = (nextpc == cs[k].exp);
+                if (good) bpass++;
+                pd->system->logToConsole("  t11 %s next=0x%x exp 0x%x %s",
+                                         cs[k].nm, (unsigned)nextpc, (unsigned)cs[k].exp,
+                                         good ? "ok" : "BAD");
+                if (k == 4) { // JAL also links r31
+                    btotal++;
+                    int g2 = (reg[31] == 0x07000404);
+                    if (g2) bpass++;
+                    pd->system->logToConsole("  t11 JAL r31=0x%x exp 0x07000404 %s",
+                                             (unsigned)reg[31], g2 ? "ok" : "BAD");
+                }
+            } else {
+                pd->system->logToConsole("  t11 %s: translate failed BAD", cs[k].nm);
+            }
+        }
+
+        pd->system->logToConsole("pd_jit_test: branch self-test %d/%d -> %s",
+                                 bpass, btotal, bpass == btotal ? "BRANCH OK" : "BRANCH FAIL");
         pd_jit_free(&j);
     }
 }

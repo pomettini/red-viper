@@ -30,6 +30,7 @@ SRC = \
 	src/pd_video.c \
 	src/pd_itcm.c \
 	src/pd_jit.c \
+	src/pd_jit_run.c \
 	src/pd_jit_test.c \
 	core/v810_cpu.c \
 	core/v810_ins.c \
@@ -46,6 +47,10 @@ UASRC =
 # RV_PLAYDATE is set for both device and simulator builds (UDEFS applies to
 # both), so we can guard out 3DS-frontend-only code regardless of which
 # Playdate target is being compiled.
+# RV_JIT: register-allocating basic-block dynarec. CORRECT (runs Wario Land
+# cleanly) but ~3x slower than the interpreter without block chaining (Stage 5),
+# so it's OFF by default. Toggling this flag requires `make clean` (make doesn't
+# track flag changes). See NOTES "BASIC-BLOCK BACKEND".
 UDEFS = -DRV_PLAYDATE=1
 UADEFS =
 ULIBDIR =

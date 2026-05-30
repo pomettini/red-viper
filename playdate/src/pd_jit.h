@@ -18,6 +18,13 @@
 typedef struct {
     uint32_t   v810_pc;    // V810 address this block starts at (0 = empty slot)
     void      *entry;      // callable native entry (Thumb bit set)
+    // Dispatcher metadata (filled by pd_jit_block_for). A block with
+    // pc_bytes == 0 is a "stub" recording that this PC begins with a
+    // non-translatable instruction, so the dispatcher won't retry translating.
+    uint16_t   pc_bytes;   // V810 bytes the block advances PC by
+    uint16_t   cycles;     // V810 cycles the block consumes (sum of opcycle[])
+    uint8_t    last_op;    // opcode of the block's final instruction
+    uint32_t   gen;        // code-gen epoch at translation (see jit_state.flush_gen)
 } jit_block;
 
 typedef struct {
@@ -33,6 +40,13 @@ typedef struct {
     jit_block *blocks;
     uint32_t   block_mask; // capacity-1 (capacity is a power of two)
     uint32_t   block_count;
+
+    // Code-gen epoch. A block is safe to execute only once its emitted code
+    // has been flushed to the I-cache. Translation stamps the block with the
+    // current flush_gen; pd_jit_flush increments it. A block is executable iff
+    // block.gen < flush_gen. This lets us batch clearICache() to once per frame
+    // instead of once per translated block.
+    uint32_t   flush_gen;
 } jit_state;
 
 // Allocate the code cache (code_bytes) and block map (block_capacity entries,
@@ -72,5 +86,29 @@ static inline uint32_t pd_jit_code_free(const jit_state *j) {
 // pd_jit_flush before executing.
 void *pd_jit_translate(jit_state *j, const uint16_t *src, uint32_t start_pc,
                        int max_insns, int *out_count);
+
+// Dispatcher entry point. Return the block for v810_pc, translating one from
+// `src` (the native-order V810 instruction stream at v810_pc) on a miss. The
+// returned block carries pc_bytes/cycles/last_op metadata. Returns NULL only if
+// the cache/map is full and cannot be reset. A returned block may be a stub
+// (pc_bytes == 0) meaning v810_pc starts with a non-translatable instruction —
+// the caller should interpret it. Callers must still check block.gen <
+// flush_gen before executing (freshly translated code isn't I-cache-coherent
+// until the next pd_jit_flush).
+jit_block *pd_jit_block_for(jit_state *j, uint32_t v810_pc, const uint16_t *src);
+
+// Register-allocating, lazy-flag translator (Stage 1 of the real backend).
+// Same contract as pd_jit_translate, but blocks take r0 = cpu_state* and keep
+// V810 operands resident in ARM r4-r10 across the block, materialising PSW once
+// at the end. Translates the move/arith/logic subset; stops at the first
+// unsupported op. Validated by the t9 self-test before any game integration.
+void *pd_jit_translate_ra(jit_state *j, const uint16_t *src, uint32_t start_pc,
+                          int max_insns, int *out_count);
+
+// Dispatcher lookup for the RA backend: returns the basic block at v810_pc,
+// translating on a miss. The block's entry is uint32_t blk(cpu_state*) and
+// returns the next V810 PC. A returned block with pc_bytes == 0 is a stub
+// (untranslatable lead op — interpret it). Check gen < flush_gen before exec.
+jit_block *pd_jit_block_for_ra(jit_state *j, uint32_t v810_pc, const uint16_t *src);
 
 #endif // PD_JIT_H
