@@ -1240,6 +1240,73 @@ renders leaves the CPU running with a warmer cache. So frameskip helps twice —
 directly (less render) and indirectly (less cache pollution). This is the
 "feel" lever for render-heavy / affine games.
 
+## 2026-05-30 — PER-GAME TEST RESULTS (interpreter + 1bpp renderer, on device)
+
+Measured on hardware with the shipping config (interpreter, 1bpp renderer,
+RV_JIT off). `int` = CPU emulation/frame, `vip`+`blit` = render/frame, `tot` =
+per-Playdate-frame wall time; game-speed fps ≈ 1000/tot (50 = real VB speed).
+Frameskip (system menu) skips only rendering — it helps **render-bound** games
+and is useless-to-harmful for **CPU-bound** ones.
+
+| Game | ROM | Bottleneck | int (ms) | vip (ms) | ~fps (no skip) | Frameskip verdict |
+|------|-----|-----------|----------|----------|----------------|-------------------|
+| **Galactic Pinball** | 1M | mixed: **light menus / render-heavy table** | 6 menus → ~22 table | 4–5 menus → 20–29 table | **~50 menus**, ~20–23 table | Helps the table (render-bound) |
+| **Mario's Tennis** | 512K | **render** (affine court) | 12–22 | 11–44 | ~16 (court) | **Big win** — Skip 2 → ~33–40 fps game-speed |
+| **Panic Bomber** | 512K | CPU (moderate) | 10 menu → 33–42 play | 2–18 | ~18–22 (busy) | Modest; capped by int |
+| **Wario Land** | 2M | CPU | 45 (L1) → 60–115 (L2) | ~10 | ~18 (L1) | Minor (removes ~10 ms render) |
+| **Mario Clash** | 1M | CPU | 70–90 | 6–12 (25 in FX scenes) | ~10–13 | Modest (more in FX scenes) |
+| **Teleroboxer** | 1M | **CPU (worst)** | **85–107** | 4–38 | ~8–11 | **Harmful** — slideshow, no speed gain |
+
+Per-game notes & what could help:
+- **Galactic Pinball** — **the breakthrough / best case.** Menus and simple
+  screens hit FULL 50 fps (int ~6 ms, vip ~5 ms) — the first game to do so, and
+  proof that the interpreter is NOT a fixed high floor: it's ~6 ms when the game
+  itself is light. The actual pinball table is a dense full-screen normal-world
+  background, pushing vip to ~20–29 ms with moderate CPU (~22 ms), so table play
+  is ~20–23 fps and **render-bound** (so frameskip helps it, unlike the
+  CPU-bound games). Validates the project goal: genuinely light games/scenes run
+  at real speed.
+- **Mario's Tennis** — the 1bpp renderer made normal/object cheap; the affine
+  court (~43 ms vip) is the wall. Affine micro-opt gained only ~3% (per-pixel
+  compute-bound). *Lever:* frameskip (works well); a bigger win would be
+  rendering affine layers at reduced resolution (e.g. half-width, doubled) — a
+  "feel over accuracy" trade, ~2× on affine, not yet implemented.
+- **Panic Bomber** — normal/object only, so vip is tiny; it's CPU-bound at
+  ~33–42 ms in busy play (~24–30 fps ceiling). *Lever:* none cheap; bounded by
+  the interpreter/memory wall. Skip 1 is the sweet spot if any.
+- **Wario Land** — renderer already fixed (vip 25–45→~10 ms); now CPU-bound,
+  worse in busy level 2. *Lever:* faster CPU only; dynarec proven non-viable on
+  this hardware.
+- **Mario Clash** — normal-world action; vip is low (CPU-bound at ~70–90 ms,
+  ~10–13 fps), with occasional render-heavier FX scenes (vip ~25 ms) where
+  frameskip helps more. A 1 MB ROM, so it lands between the 512K games and
+  Teleroboxer — consistent with ROM size / working set driving CPU cost.
+  *Lever:* none cheap; CPU/memory-wall bound.
+- **Teleroboxer** — heaviest CPU case: 1 MB ROM (largest working set → worst
+  memory-wall behaviour) plus per-frame affine-parameter + likely heavy FPU math
+  for the scaling fighters. ~10 fps and frameskip backfires (CPU-bound + low base
+  fps → visual slideshow). *Lever:* none viable on this hardware; would need a
+  working dynarec (ruled out) or game-specific interpreter hot-path tuning
+  (bounded). Treat as out of scope for full speed.
+
+**Pattern / feasibility verdict (refined by Galactic Pinball):**
+- The interpreter is **not** a fixed high floor — `int` is ~6 ms when the game
+  does little per-frame work (Pinball menus) and scales up with the game's own
+  CPU load (Wario/Teleroboxer do genuinely huge per-frame work). So **light
+  games and light scenes hit full 50 fps.** This answers the project's central
+  question: *yes*, less-demanding games are practical on this port.
+- With the 1bpp renderer, normal/object rendering is usually cheap, but a
+  **dense full-screen normal world** (Pinball table) can still cost ~25 ms vip,
+  making some scenes render-bound; affine (Tennis) likewise. Frameskip is the
+  "feel" lever for those.
+- The games that **won't** reach 50 fps are the CPU-heavy ones: action games
+  with lots of per-frame logic, FPU/affine-CPU scalers (Teleroboxer), and the
+  big-ROM titles whose working set thrashes the 16 KB cache (memory wall). For
+  those, neither frameskip (CPU-bound) nor the dynarec (ruled out on this HW)
+  helps materially.
+- Net: **practical for less-demanding games (the stated goal); not for the
+  heaviest commercial titles at full speed.**
+
 ## HONEST CHECKPOINT before the dispatcher (step 3d)
 
 The straight-line translator is complete and trustworthy. What remains for a
