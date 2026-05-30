@@ -1437,3 +1437,120 @@ game from ~15 fps toward ~25–30 fps — a real improvement, but bounded. For
 "less demanding" games (the project's stated target), the interpreter is
 already adequate (~30 fps). This is the inflection point to decide how far to
 invest.
+
+---
+
+# POSTMORTEM (2026-05-30)
+
+*Written to wrap up the first arc of the project. Inspired in tone by the
+Beetle VB Playdate postmortem — honest about what worked, what didn't, and what
+the hardware simply won't allow.*
+
+## What we set out to answer
+
+One question, not "ship a polished emulator": **is Virtual Boy emulation
+practical on the Playdate for the less-demanding end of the library, if we
+optimise for speed and "feel" over graphics accuracy?** Red Viper (the 3DS VB
+emulator) was the starting point because its V810 core is fast and portable.
+The Playdate is a Cortex-M7 at 180 MHz with a 1-bit 400×240 panel, 16 KB I/D
+caches, and SDRAM-resident code — a far cry from the 3DS's GPU and cache budget.
+
+**Answer: yes, with a clear and predictable boundary.** Low-action games
+(puzzle, board, pinball, menus) and the calm scenes of bigger games run at the
+full 50 fps panel rate; busy action and any 3D engine fall to 10–20 fps
+slow-mo, and no amount of effort we could find moves that line on this hardware.
+
+## What we built (and what each was worth)
+
+- **1-bit renderer rewrite — the single biggest win.** Replacing the 2bpp
+  software compositor with a column-major 1bpp path (lazy tile cache, threshold
+  shading, transpose-blit to the Playdate framebuffer) cut normal/object render
+  cost dramatically (Wario vip 25–45 ms → ~10 ms). This is what turned "every
+  game is a slideshow" into "light games are full speed." Worth every hour.
+- **Busy-wait fast-forwarding — high leverage, low cost.** Detecting idempotent
+  spin loops and skipping to the next event. The standout: RedSquare went from
+  9 fps to ~50 fps once we fixed a false-rejection in the detector (the
+  `reg1==reg2` reload heuristic). A reminder that *one* mis-emulated idle loop
+  can masquerade as "the CPU is too slow."
+- **Frameskip "feel" mode — useful but narrow.** Run the CPU every frame (logic
+  stays correct), gate only the render. It genuinely helps *render-bound* games
+  (Mario's Tennis: ~16 → ~33–40 fps feel) and even speeds the interpreter via
+  reduced cache pollution. But it does nothing for CPU-bound games, and on
+  constant scrollers (Fishbone) dropped frames cause judder → motion sickness.
+  So it's a per-game tool, not a global fix.
+- **The dynarec — the big swing that missed.** A full V810→Thumb-2
+  register-allocating basic-block JIT: emitter, code cache, translator, lazy
+  CPSR flags, register allocation into r4–r10, branch handling, dispatcher. It
+  is **correct** — it runs Wario Land cleanly and passes a full self-test
+  suite. It is also **~3× slower than the interpreter without block chaining**,
+  and Stage 5a measurement showed why: ~780 cycles/block, **memory-bound**. The
+  generated code lives in SDRAM and thrashes the 16 KB I-cache; the M7 spends
+  its time fetching, not executing. This matches the Beetle VB postmortem's
+  finding exactly. We disabled it (kept in-tree, gated off, fully documented).
+
+## What we learned (the findings that surprised us)
+
+1. **The interpreter is not a fixed floor.** Going in, we assumed `int` was a
+   constant ~45 ms tax. It isn't — it's ~5–8 ms when a game does little
+   per-frame work and balloons to 50–120 ms when it does a lot. Galactic
+   Pinball menus hitting 50 fps was the moment this clicked.
+2. **The predictor is per-frame CPU intensity, not ROM size.** ROM size was a
+   tempting proxy and it's wrong: Space Squash (512K) is as CPU-heavy in combat
+   as the 1 MB titles, and calm in menus. The real axis is *how much the game
+   thinks per frame* — i.e. action/3D intensity.
+3. **The memory wall is the ceiling, and it's made of cache, not clock.** The
+   dynarec failure wasn't a bug or a missing optimisation — it was 16 KB of
+   I-cache against SDRAM-resident generated code. This is the hardest constraint
+   on the platform and the one that ended the "make everything fast" dream.
+4. **Correct ≠ fast, and "fast enough" is often already here.** The dynarec
+   taught us that a fully correct, well-tested system can still be the wrong
+   answer. Meanwhile the interpreter was already adequate for the target games.
+
+## Where it landed (15 games tested on device)
+
+- **Genuinely good (~30–50 fps, fun):** RedSquare, V-Tetris, Galactic Pinball
+  (menus/light), Mario's Tennis with frameskip.
+- **Playable / scene-dependent:** Jack Bros, Space Squash, Panic Bomber,
+  Insmouse (calm areas ~28–50, combat ~10–15).
+- **CPU-floored (10–15 fps slow-mo):** Wario Land, Mario Clash, Teleroboxer,
+  Insecticide, Ballface, Fishbone scrolling.
+- **Outliers:** Space Invaders (pathological CPU spikes, black-screen phases);
+  Ballface (also visually broken — see h-bias gap below).
+
+## Known gaps / debt left behind
+
+- **h-bias backgrounds (`bgm==1`) are not rendered.** On the 3DS these are a GPU
+  job; our software path stubs them. Ballface exposed this — its walls draw with
+  h-bias and are simply invisible. Affects correctness, not speed.
+- **Minimal input mapping** — A/B/d-pad/(A+B=Start) only; no Select or right
+  d-pad. Blocked progress in a couple of homebrew titles.
+- **No on-device ROM picker** — ROM is a compile-time constant; every game
+  swap is a rebuild + datadisk deploy. Fine for testing, not for users.
+- **The dynarec sits unused in the tree.** Correct, gated off, ~3k lines. Kept
+  as a documented negative result rather than deleted, because the analysis is
+  the valuable part.
+
+## If we pick it back up
+
+In rough priority for *usability* (not speed — speed is largely solved within
+the hardware's limits):
+1. **On-device ROM picker** — biggest quality-of-life jump; makes the port
+   actually usable as a thing you hand to someone.
+2. **h-bias rendering** — closes the last correctness gap; makes h-bias games
+   (Ballface and others) display correctly. Won't help their frame rate.
+3. **Per-game interpreter hot-path tuning** — the only remaining *speed* lever
+   that isn't ruled out, but bounded and labour-intensive. Not worth it for the
+   target games, which already run.
+
+What we would **not** do again: revive the dynarec on this hardware. The
+memory wall is real, we measured it twice (ours + Beetle VB's), and the answer
+won't change without more cache or on-chip code RAM than the M7 offers.
+
+## Verdict
+
+The project answered its question. **Red Viper on Playdate is practical for
+less-demanding Virtual Boy games**, which was the whole point — and it does so
+on the interpreter plus a 1bpp renderer, busy-wait skipping, and an optional
+frameskip feel mode. The heaviest commercial and 3D titles are out of reach at
+full speed, and that's a hardware verdict, not a software TODO. A good place to
+pause.
