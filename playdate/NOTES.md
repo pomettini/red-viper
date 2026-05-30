@@ -1281,6 +1281,7 @@ and is useless-to-harmful for **CPU-bound** ones.
 | **V-Tetris** | 512K | light menus / mild-CPU gameplay | 4.5–6 menus → ~22 play | 6 menus → 10–14 play | **~50 menus**, ~27–30 play | Skip 1 → ~36–40 play |
 | **Space Squash** | 512K | variable: light menus / **CPU-heavy combat** | 13 menus → 45–49 combat | 5 menus → 15–42 combat | **~50 menus**, ~15–20 combat | Helps render; combat CPU-floored ~20 |
 | **RedSquare** (homebrew) | 512K | **was CPU-bound (undetected spin) → fixed → render-bound** | 98 → **4.4** (after fix) | 11–21 | 9 → **~45–50** | n/a — now near full speed |
+| **Fishbone** (homebrew) | 2M | moderate CPU (scroller) | 11 menu → 26–31 play | 6 menu → 8 play | ~50 menu, ~25 play | raises speed but choppy scroll → motion sickness |
 | **Space Invaders** | 512K | **OUTLIER: pathological spikes** | 18 normal, **180–290 spikes** | 16 normal, **130 spike** | ~3–40 (unstable) | n/a — black-screen CPU phases |
 | **Mario's Tennis** | 512K | **render** (affine court) | 12–22 | 11–44 | ~16 (court) | **Big win** — Skip 2 → ~33–40 fps game-speed |
 | **Panic Bomber** | 512K | CPU (moderate) | 10 menu → 33–42 play | 2–18 | ~18–22 (busy) | Modest; capped by int |
@@ -1289,6 +1290,8 @@ and is useless-to-harmful for **CPU-bound** ones.
 | **Jack Bros** | 1M | CPU + render-heavy scenes | 41–50 | 3–5 simple → 30–38 busy | ~12–22 | Helps busy scenes; CPU-floored ~20 |
 | **Teleroboxer** | 1M | **CPU (worst commercial)** | **85–107** | 4–38 | ~8–11 | **Harmful** — slideshow, no speed gain |
 | **Insecticide** (homebrew) | 2M | **CPU (worst overall, 3D engine)** | **96–122** | 4–40 | ~6–10 | n/a — CPU-bound |
+| **Ballface** (homebrew) | 2M | **CPU-bound + incomplete render (h-bias gap)** | 113–141 | ~2.7 (HUD only) | ~7–8 | n/a — walls missing + slow |
+| **Insmouse no Yakata** | 1M | **scene-variable (VIP- AND CPU-bound by scene); renders OK** | 5–92 | 5–29 | ~10 (combat) – ~50 (menu) | partial — render-bound corridors only |
 
 Per-game notes & what could help:
 - **Galactic Pinball** — **the breakthrough / best case.** Menus and simple
@@ -1308,6 +1311,14 @@ Per-game notes & what could help:
   it's CPU-bound. **Second confirmed fun game** after Mario's Tennis. Validates
   the goal: a less-demanding game made genuinely playable by 1bpp renderer +
   frameskip.
+- **Fishbone** (homebrew) — 2 MB side-scroller; menu ~50 fps, gameplay
+  moderately CPU-bound (int ~30 ms ⇒ ~25 fps), genuine work (not a spin; the
+  busywait fix doesn't apply). **Key UX finding: frameskip is poorly suited to
+  constantly-scrolling games** — when the whole screen pans every frame, dropped
+  frames make the scroll judder in big jumps → motion sickness. Frameskip only
+  feels good when the background is ~static and just sprites move (Tennis court,
+  V-Tetris board). So Skip 0 (~25 fps, slow-mo) is the better *experience* here
+  despite frameskip raising the raw speed number.
 - **Space Invaders** — problematic OUTLIER, not representative. Normal phases
   ~25–40 fps, but hits two pathologies: (1) a heavy CPU routine at ROM
   fff87e..–fff87fba that runs ~6× slower than typical code (int 180–290 ms for
@@ -1346,6 +1357,24 @@ Per-game notes & what could help:
   Frameskip removes the render half (helps busy scenes toward the ~20 fps CPU
   floor) but can't beat the int floor — stays slow-mo. Same bucket as
   Wario/Mario Clash; not a "fun" candidate.
+- **Ballface** (homebrew) — 2 MB; very CPU-bound (int ~115–140 ms ⇒ ~7–8 fps,
+  genuine main-loop work) AND renders incompletely: only the HUD + a white line
+  draw, walls/level missing (vip ~2.7 ms — almost nothing composited). Almost
+  certainly the level uses **h-bias backgrounds (bgm==1), which our renderer
+  doesn't implement** (TODO; 3DS draws h-bias on the GPU). First game in the set
+  where the h-bias gap visibly bites. Unplayable on both counts; confirming the
+  cause would need a world-type survey. *If h-bias rendering were ever added it'd
+  fix the visuals but not the ~7 fps CPU wall.*
+- **Insmouse no Yakata** — VB launch first-person 3D maze/shooter. The most
+  **scene-variable** game tested, and the only one that flips between VIP-bound and
+  CPU-bound depending on the scene: menus/intro hit a full **~50 fps** (int ~8,
+  vip ~5); light corridors are **render-bound** (~28 fps, int ~5.5 / vip ~29 — so
+  frameskip would help *these*); active 3D dungeon scenes are **CPU-bound**
+  (~15 fps, int ~54) dropping to **~10 fps** in the busiest moments (int ~82–92).
+  Unlike Ballface it **renders correctly** — its 3D walls use normal/affine worlds,
+  not the unimplemented h-bias path. Verdict: a "half-playable" 3D title — fine to
+  walk/menu, slow-mo once combat engages. Same per-frame-CPU ceiling as the other
+  3D games, but with genuine fast lulls (so it sits a notch above Insecticide).
 - **Insecticide** (homebrew) — 2 MB homebrew 3D/first-person engine; the heaviest
   CPU case overall (int ~96–122 ms ⇒ ~6–10 fps): per-frame 3D math
   (raycasting/polygons + FPU) on the V810. CPU-bound, frameskip can't help. Also
