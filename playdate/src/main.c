@@ -26,7 +26,7 @@ static const char* SYSTEM_FONT_PATH =
 static LCDFont* s_font = NULL;
 static const char* s_load_err = NULL;
 
-static const char* ROM_PATH = "marios_tennis.vb";
+static const char* ROM_PATH = "galactic_pinball.vb";
 
 // Frame-skip "feel" mode, adjustable at runtime via the Playdate system menu
 // (the menu button, so it doesn't steal game input). The interpreter runs every
@@ -153,6 +153,10 @@ static int update(void* userdata)
 
     unsigned int t_end = pd->system->getCurrentTimeMilliseconds();
     float total_ms = (float)(t_end - t_start);
+
+    // Built-in game-speed FPS counter (the update-callback rate = VB frames
+    // advanced/sec). Drawn after the blit so the frame's memset doesn't wipe it.
+    pd->system->drawFPS(2, 2);
 
     s_prof.count++;
     s_prof.total_sum  += total_ms;
