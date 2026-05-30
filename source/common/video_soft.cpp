@@ -582,9 +582,114 @@ static void render_affine_world_1bpp(WORLD *world) {
     }
 }
 
-// 1bpp render path: composites the left eye of all enabled normal/object/affine
-// worlds into pd_render_fb1. h-bias (bgm==1) is not yet ported (the original
-// 2bpp path also leaves it as a TODO), so those layers are skipped.
+// 1bpp port of h-bias (bgm==1): a normal, *unscaled* background where every
+// scanline gets its own horizontal shift `p` read from the param table
+// (u = mx + p, v = my + y). Because the shift varies per line we can't reuse
+// the column-major tile walk of render_normal_world_1bpp — we sample per pixel
+// like the affine path, just with an integer 1:1 step instead of a fractional
+// one. Left eye only (eye_offset is therefore 0, so we always read params[y*2]).
+template<bool over>
+static void render_hbias_world_1bpp(WORLD *world) {
+    const int eye = 0;
+    if (!(world->head & (0x8000 >> eye))) return;  // left eye not enabled
+
+    uint8_t mapid = world->head & 0xf;
+    uint8_t scx_pow = ((world->head >> 10) & 3);
+    uint8_t scy_pow = ((world->head >> 8) & 3);
+    uint8_t scx = 1 << scx_pow;
+    uint8_t scy = 1 << scy_pow;
+    int16_t base_gx = (s16)(world->gx << 6) >> 6;
+    int16_t gp = (s16)(world->gp << 6) >> 6;
+    int16_t gy = world->gy;
+    int16_t base_mx = (s16)(world->mx << 3) >> 3;
+    int16_t mp = (s16)(world->mp << 1) >> 1;
+    int16_t my = (s16)(world->my << 3) >> 3;
+    int16_t w = world->w + 1;
+    int16_t h = world->h + 1;
+    int16_t over_tile = world->over & 0x7ff;
+
+    u16 *tilemap = (u16 *)(vb_state->V810_DISPLAY_RAM.off + 0x20000);
+    u16 param_base = world->param;
+    s16 *params = (s16 *)(vb_state->V810_DISPLAY_RAM.off + 0x20000 + param_base * 2);
+    u8 *gplt = vb_state->tVIPREG.GPLT;
+
+    int mx = base_mx - mp;  // eye 0
+    int gx = base_gx - gp;
+    uint8_t *fb = pd_render_fb1;
+
+    // Per-tile cache, same idea as the affine path: recompute the tilemap read,
+    // flip flags and palette→bright table only when the source tile changes
+    // (every 8 source pixels), leaving the inner loop to do coordinate math, one
+    // tile-data read and the write. bright[c] = does index c map (via this
+    // tile's palette) to a shade >= the white threshold; index 0 is transparent.
+    int prev_tile_pos = -1;
+    int c_tileid = 0;
+    bool c_hflip = false, c_vflip = false;
+    uint8_t bright[4] = {0, 0, 0, 0};
+
+    for (int y = 0; likely(y < h); y++) {
+        int sy = gy + y;
+        if (unlikely(sy < 0)) continue;
+        if (unlikely(sy >= 224)) break;
+
+        // 13-bit signed horizontal offset for this line (left eye = params[y*2]).
+        s16 p = (s16)(params[y * 2] << 3) >> 3;
+        int u0 = mx + p;
+        int v = my + y;
+
+        int vty = v >> 3;
+        int vmapy = vty >> 6;
+        vty &= 63;
+        if (!over) vmapy &= scy - 1;
+        int dbpy = (v & 7) << 1;
+
+        uint8_t bit = (uint8_t)(1 << (sy & 7));
+        int row = sy >> 3;
+
+        for (int x = 0; likely(x < w); x++) {
+            int cx = gx + x;
+            if (unlikely(cx < 0)) continue;
+            if (unlikely(cx >= 384)) break;
+
+            int u = u0 + x;
+            int tx = u >> 3;
+            int umapx = tx >> 6;
+            tx &= 63;
+            if (!over) umapx &= scx - 1;
+            int bpx = u & 7;
+
+            int tile_pos;
+            if (over && unlikely((umapx & (scx - 1)) != umapx || (vmapy & (scy - 1)) != vmapy)) {
+                tile_pos = over_tile;
+            } else {
+                int this_map = mapid + scx * vmapy + umapx;
+                tile_pos = this_map * 4096 + 64 * vty + tx;
+            }
+            if (tile_pos != prev_tile_pos) {
+                prev_tile_pos = tile_pos;
+                u16 tile = tilemap[tile_pos];
+                c_tileid = tile & 0x07ff;
+                c_hflip = (tile & 0x2000) != 0;
+                c_vflip = (tile & 0x1000) != 0;
+                int pal = gplt[tile >> 14];
+                bright[1] = (uint8_t)(((pal >> 2) & 3) >= 2);
+                bright[2] = (uint8_t)(((pal >> 4) & 3) >= 2);
+                bright[3] = (uint8_t)(((pal >> 6) & 3) >= 2);
+            }
+            int px  = c_hflip ? 7 - bpx : bpx;
+            int dpy = c_vflip ? (7 << 1) - dbpy : dbpy;
+            int pxindex = (tileCache[c_tileid].indices.u16[px] >> dpy) & 3;
+            if (pxindex) {
+                uint8_t *out_word = &fb[cx * RV_FB1_STRIDE + row];
+                if (bright[pxindex]) *out_word |= bit;
+                else                 *out_word &= (uint8_t)~bit;
+            }
+        }
+    }
+}
+
+// 1bpp render path: composites the left eye of all enabled normal/object/affine/
+// h-bias worlds into pd_render_fb1.
 void video_soft_render_1bpp(void) {
     memset(pd_render_fb1, 0, 384 * RV_FB1_STRIDE);
 
@@ -663,8 +768,13 @@ void video_soft_render_1bpp(void) {
                 render_affine_world_1bpp<true>(&worlds[wrld]);
             else
                 render_affine_world_1bpp<false>(&worlds[wrld]);
+        } else if (worlds[wrld].bgm == 1) {
+            // h-bias world
+            if (worlds[wrld].is_over)
+                render_hbias_world_1bpp<true>(&worlds[wrld]);
+            else
+                render_hbias_world_1bpp<false>(&worlds[wrld]);
         }
-        // bgm==1 (h-bias) not yet ported to 1bpp
     }
 }
 #endif

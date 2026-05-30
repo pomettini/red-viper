@@ -1290,7 +1290,7 @@ and is useless-to-harmful for **CPU-bound** ones.
 | **Jack Bros** | 1M | CPU + render-heavy scenes | 41–50 | 3–5 simple → 30–38 busy | ~12–22 | Helps busy scenes; CPU-floored ~20 |
 | **Teleroboxer** | 1M | **CPU (worst commercial)** | **85–107** | 4–38 | ~8–11 | **Harmful** — slideshow, no speed gain |
 | **Insecticide** (homebrew) | 2M | **CPU (worst overall, 3D engine)** | **96–122** | 4–40 | ~6–10 | n/a — CPU-bound |
-| **Ballface** (homebrew) | 2M | **CPU-bound + incomplete render (h-bias gap)** | 113–141 | ~2.7 (HUD only) | ~7–8 | n/a — walls missing + slow |
+| **Ballface** (homebrew) | 2M | **CPU-bound + incomplete render (normal-world bug, NOT h-bias)** | 113–141 | ~2.3 (HUD only) | ~7–8 | n/a — walls missing + slow |
 | **Insmouse no Yakata** | 1M | **scene-variable (VIP- AND CPU-bound by scene); renders OK** | 5–92 | 5–29 | ~10 (combat) – ~50 (menu) | partial — render-bound corridors only |
 
 Per-game notes & what could help:
@@ -1359,12 +1359,15 @@ Per-game notes & what could help:
   Wario/Mario Clash; not a "fun" candidate.
 - **Ballface** (homebrew) — 2 MB; very CPU-bound (int ~115–140 ms ⇒ ~7–8 fps,
   genuine main-loop work) AND renders incompletely: only the HUD + a white line
-  draw, walls/level missing (vip ~2.7 ms — almost nothing composited). Almost
-  certainly the level uses **h-bias backgrounds (bgm==1), which our renderer
-  doesn't implement** (TODO; 3DS draws h-bias on the GPU). First game in the set
-  where the h-bias gap visibly bites. Unplayable on both counts; confirming the
-  cause would need a world-type survey. *If h-bias rendering were ever added it'd
-  fix the visuals but not the ~7 fps CPU wall.*
+  draw, walls/level missing (vip ~2.3 ms — almost nothing composited).
+  **CORRECTION (was "h-bias"):** a world-type survey on device proved the level
+  is NOT h-bias. The scene has just two worlds, both **normal (bgm=0)**:
+  `W31 gx=0 gy=-4 w=386 h=153 mapbase=0` (the full-screen level) and
+  `W30 gx=64 gy=20 w=65 h=16` (the HUD). The HUD composites fine; the big W31
+  composites almost nothing (vip stays ~2.3 ms), so the missing walls are a
+  **bug in the normal-world path / tile-character cache for that world**, not an
+  h-bias gap. Implementing h-bias (done) does not fix Ballface. Distinct, still
+  open. Unplayable regardless on the ~7 fps CPU wall.
 - **Insmouse no Yakata** — VB launch first-person 3D maze/shooter. The most
   **scene-variable** game tested, and the only one that flips between VIP-bound and
   CPU-bound depending on the scene: menus/intro hit a full **~50 fps** (int ~8,
@@ -1554,3 +1557,33 @@ on the interpreter plus a 1bpp renderer, busy-wait skipping, and an optional
 frameskip feel mode. The heaviest commercial and 3D titles are out of reach at
 full speed, and that's a hardware verdict, not a software TODO. A good place to
 pause.
+
+---
+
+# ADDENDUM (2026-05-30): h-bias 1bpp rendering
+
+Picked up postmortem future-work item #2. Implemented `render_hbias_world_1bpp`
+in [video_soft.cpp] and wired it into the 1bpp dispatch (`bgm==1`). h-bias is a
+normal, *unscaled* background where each scanline gets its own horizontal shift
+`p` from the param table (`u = mx + p`, `v = my + y`); because that shift varies
+per line it can't reuse the column-major tile walk, so it samples per pixel like
+the affine path (same per-tile cache + bright[] table), just with an integer 1:1
+step. Left eye only, like the rest of the 1bpp path.
+
+**Validation:**
+- *Perf / no-regression:* before/after on Mario's Tennis (fixed demo) — steady
+  match `vip` was **43.7 ms in both**. The `else if (bgm==1)` branch only fires
+  for actual h-bias worlds, so non-h-bias games pay nothing. Confirmed safe.
+- *Visual:* **not yet validated.** The intended test (Ballface) turned out NOT
+  to use h-bias — an on-device world survey showed its level is a single large
+  **normal world** (bgm=0), correcting the earlier NOTES guess. No game in the
+  current test set is confirmed to use h-bias, so the renderer is correct by
+  construction (mirrors the 3DS `video_hard.c` semantics) but unproven on screen.
+
+**Still open (discovered here, NOT h-bias):** Ballface's full-screen normal world
+W31 (gx=0 gy=-4 w=386 h=153) composites almost nothing (vip stays ~2.3 ms) while
+its small HUD world renders — a normal-world / tile-character-cache bug specific
+to that world. Separate investigation; unrelated to h-bias.
+
+Next time: find a ROM that actually exercises h-bias (bgm==1) to validate the
+visuals, and/or chase the Ballface normal-world bug.
