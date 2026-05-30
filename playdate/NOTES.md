@@ -1491,6 +1491,61 @@ slow-mo, and no amount of effort we could find moves that line on this hardware.
   its time fetching, not executing. This matches the Beetle VB postmortem's
   finding exactly. We disabled it (kept in-tree, gated off, fully documented).
 
+## Why the dynarec can't win on this hardware (consolidated)
+
+The evidence for this is scattered through the log above; this is the one-page
+version, including the two reasons the obvious rescues fail.
+
+**What a dynarec is supposed to buy.** An interpreter, per V810 instruction,
+fetches the opcode, decodes it, dispatches through a `switch`, executes, updates
+flags, loops — mostly *overhead* around the real work. A JIT translates a block
+of V810 code **once** into native Thumb-2 that does just the work, keeping hot
+V810 registers in ARM registers. On most platforms that deletes the dispatch
+overhead for a 3–10× win. Ours worked (ran Wario Land correctly) — it was just
+~3× *slower*.
+
+**The hardware that decides it.** The Playdate M7 has a **16 KB instruction
+cache**, and code lives in **external SDRAM** (`0x60000000`) whose fetches stall
+the CPU on a cache miss. There is also a small **ITCM** (fast, zero-wait code
+RAM — that's the `.itcm.rv` section in `link_map.ld`), but it is tiny (we ration
+it in *bytes*). On this chip, **instruction fetch is not free** — speed is
+governed by whether the code you're about to run is already in those 16 KB.
+
+**Why the trade loses.**
+- The **interpreter is small and hot**: its dispatch loop is a few KB, executed
+  over and over, so it lives in the I-cache and stays there. Its fetches are
+  almost all hits → it runs at full clock.
+- **JIT code is large and scattered**: each V810 block expands to many ARM
+  instructions, and a real game has thousands of blocks across a big code cache
+  in SDRAM. Jumping between them constantly misses the 16 KB I-cache → every
+  block fetch stalls on SDRAM. Measured: **~780 cycles per block** for a
+  handful of instructions = mostly *stalled on fetch*, not computing.
+
+So the dynarec trades *many cheap ops running from hot cache* for *fewer ops
+that each stall on a cache miss*. Instruction **count** drops; memory **stalls**
+rise more. Net slower. That is the memory wall.
+
+**Why the two obvious rescues fail:**
+1. **Block chaining** (the unbuilt "Stage 5") removes the return-to-C dispatcher
+   between blocks — real overhead — but the chained-to code still lives in SDRAM
+   and still misses the I-cache. It attacks *dispatch*, not the *fetch stall*,
+   so its best case is interpreter parity, not a win.
+2. **Putting JIT code in ITCM** is exactly the right idea — ITCM is the fast
+   code RAM that would make it fly — but ITCM is far too small (KBs) to hold a
+   JIT code cache (hundreds of KB for a real game). The one memory that would
+   make a dynarec fast cannot hold one.
+
+**The takeaway in one line:** the interpreter is the *right shape* for a
+tiny-cache / slow-SDRAM machine (small hot code, small cache-friendly state);
+the dynarec is the *wrong shape* (lots of cold code in slow memory), which is
+precisely what this memory hierarchy punishes hardest. Dynarecs win on the 3DS
+(red-viper's origin), PSP, and desktop — machines with roomy caches or fast code
+RAM. The Playdate has neither. "Not viable" here means **"not profitable"**: a
+heroically compact, fully-chained, ITCM-trampolined JIT might reach interpreter
+*parity*, but we started 3× behind and the SDRAM-fetch cost caps the ceiling —
+bad effort/payoff. Hence: shelved, not deleted; the negative result is itself
+the finding.
+
 ## What we learned (the findings that surprised us)
 
 1. **The interpreter is not a fixed floor.** Going in, we assumed `int` was a

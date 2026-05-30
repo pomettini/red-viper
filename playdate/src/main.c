@@ -26,7 +26,7 @@ static const char* SYSTEM_FONT_PATH =
 static LCDFont* s_font = NULL;
 static const char* s_load_err = NULL;
 
-static const char* ROM_PATH = "galactic_pinball.vb";
+static const char* ROM_PATH = "marios_tennis.vb";
 
 // Frame-skip "feel" mode, adjustable at runtime via the Playdate system menu
 // (the menu button, so it doesn't steal game input). The interpreter runs every
