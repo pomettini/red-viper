@@ -1813,9 +1813,35 @@ on alloc failure. main.c now calls `rom_picker_free()` once a ROM is selected
 
 Measured (Tennis, frameskip off): **title court vip 48.7 → 43.5 ms** — full
 recovery of the layout debt (baseline was 43.7); court int ~27.0 and menus
-~13.7 match the best build. Demo-match int read ~40 vs ~29 on the best build,
-but that phase's content (matchup) varies per run and the content-stable
-phases show zero regression — pending one more run to attribute. Scoreboard of
-the vip-debt hunt: code-side theories (falign, hot-pinning) both falsified;
-data-side theory confirmed on the third try. The renderer's perf is governed by
-**.bss layout of its data buffers**, not code placement.
+~13.7 match the best build. Scoreboard of the vip-debt hunt: code-side theories
+(falign, hot-pinning) both falsified; data-side theory confirmed on the third
+try. The renderer's perf is governed by **.bss layout of its data buffers**,
+not code placement.
+
+**ATTRIBUTION FOLLOW-UP (two more runs): demo-match int read ~38-40 vs the
+earlier ~29** — initially blamed on the .bss shift, but **later RETRACTED as
+confounded**: the user discovered Tennis's demo randomly alternates 2-player
+and 4-player matches, and 4P costs roughly +10 ms int over 2P. The 29-vs-38
+split almost certainly tracked player count, not layout. **Benchmarking rule
+from here on: the title court is the only content-stable Tennis phase; demo
+int comparisons require matching player counts.** The layout-lottery lesson
+stands in general (per-phase numbers can move ±15-20% on .bss shifts), but
+this particular regression claim is withdrawn. Slimming verdict unchanged:
+keep (vip 48.7→43.5 on the stable phase + library hygiene).
+
+## ADDENDUM (2026-06-03): affine span renderer
+
+Option-B structural work: when an affine scanline has no rotation term
+(dy == 0), the source row is constant, so render in RUNS — pixels sharing one
+source texel — hoisting tilemap reads, flip flags and index extraction out of
+the per-pixel loop (one ceil-div per run, write-only inside). Implemented as a
+fast path inside render_affine_world_1bpp; rotated rows keep the generic
+per-pixel loop.
+
+First device run (court renders correctly — no artifacts):
+- **Demo match vip 22.5 → ~18.5 (-18%)** — magnified court rows get runs of
+  2+, the span win is real where it matters (gameplay).
+- **Title court vip 43.5 → 46.8 (+3.3)** — zoomed-OUT court rows are minified
+  (dx >= 0x200): every run is length 1, so the per-run SDIV + bookkeeping is
+  pure overhead. Fixed by gating the fast path to dx < 0x200 (magnified rows
+  only); minified rows stay on the generic loop. Re-measure pending.

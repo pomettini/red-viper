@@ -542,6 +542,73 @@ static void render_affine_world_1bpp(WORLD *world) {
             end = fb + 384 * RV_FB1_STRIDE;
         }
 
+        // Span fast path for the common scale-only case (no rotation term):
+        // when dy == 0 the source row is constant across the scanline, so the
+        // tilemap read, flip flags, palette table AND the texel index are all
+        // invariant for whole runs of output pixels. Walk the line as runs —
+        // run = how many output pixels sample the same source pixel (ceil of
+        // remaining sub-pixel distance / dx) — doing only the bit write per
+        // pixel inside a run, and re-fetching tile data only at 8-px tile
+        // boundaries. Magnified rows (dx < 0x200) get runs of 2+; minified
+        // rows degrade gracefully to runs of 1. Fixed-point recap: 1 source
+        // px = 0x200 units, 1 tile = 0x1000, 1 map (512 px) = 1<<18.
+        // dx <= 0 (mirrored/degenerate) stays on the generic path, and so do
+        // minified/1:1 rows (dx >= 0x200): their runs are all length 1, so the
+        // span bookkeeping (one SDIV per run) costs more than it saves —
+        // measured +3 ms vip on Mario's Tennis's zoomed-out title court.
+        if (dy == 0 && dx > 0 && dx < 0x200) {
+            int ymap = my >> (9 + 9);
+            int ty_scaled = (my >> (9 + 3 - 6)) & (63 << 6);
+            int dbpy = (my >> 8) & (7 << 1);
+            while (likely(out_word < end)) {
+                // Per-tile work (identical math to the generic loop below).
+                int xmap = mx >> (9 + 9);
+                int xmap_ymap = xmap | (ymap << 16);
+                int xmap_ymap_masked = xmap_ymap & scx_scy_mask;
+                int tx = (mx >> (9 + 3)) & 63;
+                int tile_pos;
+                if (over && unlikely(xmap_ymap != xmap_ymap_masked)) {
+                    tile_pos = over_tile;
+                } else {
+                    int this_map = mapid + (xmap_ymap_masked >> 16) * scx + (xmap_ymap_masked & 0xffff);
+                    tile_pos = this_map * 4096 + ty_scaled + tx;
+                }
+                if (tile_pos != prev_tile_pos) {
+                    prev_tile_pos = tile_pos;
+                    u16 tile = tilemap[tile_pos];
+                    c_tileid = tile & 0x07ff;
+                    c_hflip = (tile & 0x2000) != 0;
+                    c_vflip = (tile & 0x1000) != 0;
+                    int pal = gplt[tile >> 14];
+                    bright[1] = (uint8_t)(((pal >> 2) & 3) >= 2);
+                    bright[2] = (uint8_t)(((pal >> 4) & 3) >= 2);
+                    bright[3] = (uint8_t)(((pal >> 6) & 3) >= 2);
+                }
+                int dpy = c_vflip ? (7 << 1) - dbpy : dbpy;
+                int tile_end_mx = (mx & ~0xfff) + 0x1000;
+                do {
+                    int bpx = (mx >> 9) & 7;
+                    int px = c_hflip ? 7 - bpx : bpx;
+                    int pxindex = (tileCache[c_tileid].indices.u16[px] >> dpy) & 3;
+                    // Output pixels sampling this same source pixel.
+                    int run = (0x200 - (mx & 0x1ff) + dx - 1) / dx;
+                    // Clamp to remaining output columns (ceil: out_word
+                    // carries the row-byte offset, end may not).
+                    int max_run = (int)((end - out_word + RV_FB1_STRIDE - 1) / RV_FB1_STRIDE);
+                    if (run > max_run) run = max_run;
+                    if (pxindex == 0) {
+                        out_word += (size_t)run * RV_FB1_STRIDE;   // transparent
+                    } else if (bright[pxindex]) {
+                        for (int r = run; r > 0; r--) { *out_word |= bit; out_word += RV_FB1_STRIDE; }
+                    } else {
+                        for (int r = run; r > 0; r--) { *out_word &= (uint8_t)~bit; out_word += RV_FB1_STRIDE; }
+                    }
+                    mx += dx * run;
+                } while (likely(out_word < end) && mx < tile_end_mx);
+            }
+            continue;
+        }
+
         for (; likely(out_word < end); out_word += RV_FB1_STRIDE) {
             int xmap = mx >> (9 + 9);
             int ymap = my >> (9 + 9);
