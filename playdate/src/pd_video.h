@@ -15,4 +15,10 @@
 void pd_video_vip_step(PlaydateAPI *pd);
 void pd_video_blit(PlaydateAPI *pd);
 
+// Request that the next blit refreshes the WHOLE display, not just the VB
+// area. Needed when something else drew the screen (ROM picker, menus): the
+// blit normally marks only rows 8..231 as updated, so stale pixels in the
+// 8 px margins would otherwise stay on the panel forever.
+void pd_video_request_full_redraw(void);
+
 #endif

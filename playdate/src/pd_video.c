@@ -68,6 +68,14 @@ void pd_video_vip_step(PlaydateAPI *pd) {
     }
 }
 
+// Starts true so the very first emulator frame refreshes the whole panel
+// (whatever was on screen before — picker, launcher transition — gets cleared).
+static bool s_full_redraw = true;
+
+void pd_video_request_full_redraw(void) {
+    s_full_redraw = true;
+}
+
 void pd_video_blit(PlaydateAPI *pd) {
     if (!vb_state) return;
 
@@ -106,5 +114,13 @@ void pd_video_blit(PlaydateAPI *pd) {
         }
     }
 
-    pd->graphics->markUpdatedRows(MARGIN_Y, MARGIN_Y + VB_H - 1);
+    if (s_full_redraw) {
+        // Push the margin rows too (the memset above already blacked the whole
+        // buffer); without this, pixels drawn by the picker/menus would stay
+        // on the panel in the 8 px border forever.
+        s_full_redraw = false;
+        pd->graphics->markUpdatedRows(0, PD_H - 1);
+    } else {
+        pd->graphics->markUpdatedRows(MARGIN_Y, MARGIN_Y + VB_H - 1);
+    }
 }

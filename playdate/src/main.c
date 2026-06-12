@@ -52,6 +52,9 @@ static void on_rom_picked(const char* path, void* userdata) {
                                   path, rc);
         return;
     }
+    // The picker painted the whole panel; make the first emulator blit refresh
+    // the full display so its pixels don't linger in the 8 px margins.
+    pd_video_request_full_redraw();
     s_mode = APP_EMU;
 }
 
