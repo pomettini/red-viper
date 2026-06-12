@@ -1642,3 +1642,180 @@ to that world. Separate investigation; unrelated to h-bias.
 
 Next time: find a ROM that actually exercises h-bias (bgm==1) to validate the
 visuals, and/or chase the Ballface normal-world bug.
+
+---
+
+# ADDENDUM (2026-05-31): on-device ROM picker
+
+Postmortem future-work item #1. Integrated the `pomettini/pd-rom-picker` library
+as a git submodule at `playdate/pd-rom-picker` (Makefile: added
+`pd-rom-picker/src/rom_picker.c` to SRC and `pd-rom-picker/src` to UINCDIR — the
+nested build/ object dir is created automatically by the SDK `.c` rule).
+
+Flow (`main.c`): the app now has two modes, `APP_PICKER` and `APP_EMU`. At init
+we no longer hardcode a ROM — we call `start_picker()`, which configures the
+picker to scan **`/Shared/Emulation/vb/games/`** (CrankBoy convention; the picker
+mkdir's the tree on first run) for `*.vb`. `update()` dispatches: in `APP_PICKER`
+it calls `rom_picker_update()` (the lib draws + handles input itself); on A the
+lib fires `on_rom_picked(path,...)` synchronously, which `pd_core_load_rom`s the
+absolute path and flips to `APP_EMU`. `auto_load_single=1` skips the UI when
+exactly one ROM is present. A "ROM Picker" system-menu item re-enters the picker
+mid-game.
+
+One core change: `pd_core_load_rom` now opens with `kFileRead | kFileReadData`
+(was `kFileRead`) so absolute `/Shared/...` paths resolve — same fix the PM port
+needed. Builds clean for device + simulator.
+
+Caveats / follow-ups:
+- The bundled `.vb` files in the pdx are now dead weight (ROMs load from
+  /Shared); could be dropped from `Source/` to slim the bundle.
+- The mid-game "ROM Picker" item has no cancel-back-to-game (the lib has no
+  B-to-cancel); re-selecting the current ROM reloads it from reset. Minor.
+- Not yet tested on device (was disconnected at integration time) — needs a
+  device run with `.vb` files placed in `/Shared/Emulation/vb/games/`.
+  *(Update: tested on device 2026-06-02 — picker lists/loads from /Shared
+  correctly; ROMs seeded via datadisk.)*
+
+---
+
+# ADDENDUM (2026-06-02): interpreter load/store fast path + the layout lesson
+
+First "remaining optimizations" item: inline WRAM/ROM fast paths for the
+interpreter's data accesses (`itrp_rbyte/rhword/rword/wbyte/whword/wword` in
+interpreter.c, same rationale as the existing `itrp_fetch`). The generic path
+was: function pointer (`g_rv_*`) → region switch in v810_mem.c → tail call into
+the region handler → u64 return whose wait bits the interpreter discards. The
+fast path inlines the WRAM/ROM (read) and WRAM (write) cases — plain pointer
+accesses with no side effects; VIP/VSU/HW/SRAM still take the full path.
+`RV_NO_DATA_FASTPATH` compiles it out for A/B (needs `make clean`).
+
+**Measured (Mario's Tennis, frameskip off, three same-protocol runs):**
+
+| Phase (same-PC match)   | old build | picker+no-fastpath | picker+fastpath |
+|---|---|---|---|
+| Menus int               | 9.7       | 10.8               | 13.8            |
+| Title court int / vip   | 23.0/43.7 | 26.5/**48.9**      | 27.5/**48.7**   |
+| Demo match int          | ~34.7     | **~40.3**          | **~29.0**       |
+
+Conclusions:
+1. **Fast path: kept.** Gameplay (demo match) int −28% vs same-build control
+   (−17% vs old build; content varies run-to-run but both agree). Costs: +3 ms
+   on menus (still ~50 fps, invisible) and +1 ms on the vip-bound title court.
+   No correctness issues observed. ELF grew ~4 KB (the inline footprint).
+2. **The vip 43.7→48.9 regression was NOT the fast path** — identical with it
+   on or off. Adding rom_picker.o to the link shifted code placement and cost
+   ~11% of render time with zero renderer changes. **The M7 is brutally
+   layout-sensitive** (16 KB I-cache + SDRAM): the PokeMini port documented the
+   same effect and countered it with `-falign-loops=32` + hot-section pinning.
+3. Countermeasure tried and REVERTED: `-falign-loops=32 -falign-functions=32`
+   on video_soft.o (the PokeMini port's fix for the same disease) had **zero
+   effect** here — title-court vip stayed 48.7 ms exactly, demo-match int
+   unchanged (~28.3, confirming the fast-path win across a second matchup).
+   So the regression is not intra-function loop alignment; most plausibly it's
+   I-cache **set conflicts** between specific hot functions (interpreter loop /
+   renderer / blit landing in overlapping cache sets). Flags removed per
+   keep-only-what-measures. *Open item:* the heavier lever is hot-section
+   pinning in link_map.ld (PM port's `.text.hot` approach) — place
+   interpreter_run + the 1bpp render functions at controlled addresses so
+   their cache-set mapping is deliberate. ~5 ms of vip (≈10% of render) is on
+   the table for whoever picks this up.
+
+Meta-lesson re-confirmed: attribute regressions by A/B with a single toggle,
+not by eyeballing diffs — the "obvious" culprit (new interpreter code) was
+innocent of the vip change, and the real cause (link-order layout shift) would
+have been invisible without the control run. And the countermeasure that worked
+on a sibling project (PM port's falign) did NOT transfer — measure everything.
+
+**Final state shipped:** data fast path ON (interpreter.c), no special
+alignment flags. Net effect vs the pre-optimization build: gameplay int
+~35→~28-29 ms on Mario's Tennis (and proportional gains expected on all
+CPU-bound games); render vip carries a ~5 ms layout-shift debt unrelated to
+the fast path (open item above).
+
+## Hot-section pinning experiment (2026-06-03): FAILED, reverted
+
+Tried the link-script lever for the ~5 ms vip layout debt: collected
+`interpreter_run` + the 1bpp renderer into a contiguous `.text.hot` region at
+the front of .text (linker-script collector before the `*(.text.*)` glob;
+`__attribute__((section(".text.hot.*")))` tags, sorted interpreter-first;
+verified by nm: 11 KB contiguous at offset 0, templates inlined into
+`video_soft_render_1bpp`). Same Tennis protocol, frameskip off:
+
+| Phase            | fastpath (best) | + pinning | verdict |
+|---|---|---|---|
+| Title court vip  | 48.7            | 48.4      | no recovery |
+| Demo match int   | ~28.3–29.0      | ~31.5     | **+10% WORSE** |
+| Menus int        | ~12.8–13.8      | ~15.5     | worse |
+
+Reverted entirely (keep-only-what-measures). Two takeaways:
+
+1. **The I-cache code-conflict theory is disproven twice over** (falign did
+   nothing; deliberate contiguous code placement did nothing for vip). The
+   remaining suspect for the original 43.7→48.7 vip shift is **DATA layout**:
+   rom_picker.c carries a ~130 KB static struct (256 × ~520 B RomEntry array)
+   that landed in .bss and shifted every buffer after it — tileCache (~40 KB),
+   tileCache1, pd_render_fb1 (12 KB), and the heap base. The renderer is bound
+   by data traffic through the 16 KB **D-cache**, which code placement cannot
+   touch. *Untested follow-ups:* shrink rom_picker's static footprint (heap-
+   allocate or trim ROM_PICKER_MAX_FILES/PATH), and/or align/order the hot
+   render buffers deliberately.
+2. **Deliberate placement lost to accidental placement on int** (+3 ms in
+   gameplay): pinning the interpreter at offset 0 changed its conflict pattern
+   with the *unpinned* warm code (serviceInt, memory slow paths, run-frame
+   loop). Partial pinning shifts conflicts; it doesn't remove them. A future
+   attempt would need the whole warm set pinned together, sized and ordered
+   from a real profile — not worth it for 5 ms of vip on one phase.
+
+Net: the ~5 ms vip debt stays, now with a concrete (data-side) lead for
+whoever picks it up. Shipped state remains: fast path ON, no pinning, no
+alignment flags.
+
+## PSW localization experiment (2026-06-03): FAILED, reverted
+
+Theory: nearly every ALU op read-modify-writes `S_REG[PSW]` in memory for flag
+packing; `interpreter_run` already localizes PC and cycles, so localize the PSW
+too (sync at serviceInt boundaries and returns, redirect LDSR/STSR/RETI to the
+local). Mechanically straightforward, semantically verified — and **15–58%
+SLOWER on device**:
+
+| Phase            | best build | + psw local |
+|---|---|---|
+| Menus int        | ~13.8      | ~15.3       |
+| Title court int  | ~27.5      | ~31.5 (vip identical 48.7 → not layout) |
+| Demo match int   | ~29        | **~45.7**   |
+
+Why (post-mortem analysis): `interpreter_run` is one huge function — a 60-case
+switch with high register pressure. Forcing one more value to stay **live
+across the entire loop** made GCC spill other hot values (PC, cycles, the
+vb_state base pointer) across many paths. Meanwhile the "expensive" PSW memory
+RMW it replaced was nearly free: a hot, single-address read-modify-write that
+the M7's store buffer + D-cache absorb. Classic case of optimizing the
+instruction count while pessimizing the register allocation.
+
+Reverted (a do-not-redo note now sits at the top of interpreter_run). Lesson
+three of the series, and the most general: **on this core, theory-level
+micro-optimizations are coin flips; only the device decides.** The load/store
+fast path won because it removed real work (two call levels + a switch); the
+PSW change just moved a cheap cost onto a scarcer resource (registers).
+
+## rom-picker static slimming (2026-06-03): SUCCESS — vip debt RECOVERED
+
+The D-cache data-layout hypothesis was right. pd-rom-picker's state held
+`RomEntry files[256]` (two 256-byte strings each ≈ 132 KB) statically — landing
+in .bss in front of the renderer's hot buffers (tileCache ~576 KB, tileCache1
+80 KB, pd_render_fb1 12 KB) and shifting them into conflicting D-cache sets.
+Change (in the pd-rom-picker submodule — needs its own commit there):
+heap-allocate the file list in `rom_picker_init` (calloc), free in
+`rom_picker_free`; NULL-guard in `collect_file`; degrade to the empty-folder UI
+on alloc failure. main.c now calls `rom_picker_free()` once a ROM is selected
+(after the lib call returns — the callback's path points into the list), so the
+132 KB exists only while the picker is on screen.
+
+Measured (Tennis, frameskip off): **title court vip 48.7 → 43.5 ms** — full
+recovery of the layout debt (baseline was 43.7); court int ~27.0 and menus
+~13.7 match the best build. Demo-match int read ~40 vs ~29 on the best build,
+but that phase's content (matchup) varies per run and the content-stable
+phases show zero regression — pending one more run to attribute. Scoreboard of
+the vip-debt hunt: code-side theories (falign, hot-pinning) both falsified;
+data-side theory confirmed on the third try. The renderer's perf is governed by
+**.bss layout of its data buffers**, not code placement.

@@ -40,6 +40,81 @@ static inline HWORD itrp_fetch(WORD PC) {
     return (HWORD)MEM_RHWORD(PC);
 }
 
+// Fast-path data access, same rationale as itrp_fetch: the generic MEM_R*/
+// MEM_W* route through a function pointer, then a region switch in another
+// translation unit, then a tail call into the region handler — and the reads
+// return wait-state bits in the high word that the interpreter discards
+// (timing comes from opcycle[]). The bulk of game data traffic is WRAM and
+// ROM reads plus WRAM writes, all of which are plain pointer accesses with no
+// side effects (mem_wram_*/mem_rom_* below), so handle those inline and fall
+// back for the regions with real side effects (VIP, VSU, hardware regs, SRAM,
+// open bus). Masks replicate mem_wram_*/mem_rom_* exactly, including the
+// alignment forced by mem_whword/mem_wword before their region switch.
+//
+// RV_NO_DATA_FASTPATH compiles the fast path out (helpers degrade to plain
+// MEM_* calls) for on-device A/B measurement: inlining 9 call sites grows the
+// interpreter loop, and on a 16 KB I-cache the footprint cost can offset the
+// indirection win in some scenes. Toggling the flag needs `make clean`.
+#ifdef RV_NO_DATA_FASTPATH
+#define ITRP_DATA_FAST 0
+#else
+#define ITRP_DATA_FAST 1
+#endif
+
+static inline WORD itrp_rbyte(WORD addr) {
+    if (!ITRP_DATA_FAST) return (WORD)MEM_RBYTE(addr);
+    WORD region = addr & 0x07000000;
+    if (region == 0x05000000)
+        return (WORD)*(SBYTE *)(vb_state->V810_VB_RAM.off + (addr & 0x0500ffff));
+    if (region == 0x07000000)
+        return (WORD)*(SBYTE *)(V810_ROM1.off + (addr & (0x07000000 | (MAX_ROM_SIZE - 1))));
+    return (WORD)MEM_RBYTE(addr);
+}
+
+static inline WORD itrp_rhword(WORD addr) {
+    if (!ITRP_DATA_FAST) return (WORD)MEM_RHWORD(addr);
+    WORD region = addr & 0x07000000;
+    if (region == 0x05000000)
+        return (WORD)*(SHWORD *)(vb_state->V810_VB_RAM.off + (addr & 0x0500fffe));
+    if (region == 0x07000000)
+        return (WORD)*(SHWORD *)(V810_ROM1.off + (addr & (0x07000000 | (MAX_ROM_SIZE - 1)) & ~1));
+    return (WORD)MEM_RHWORD(addr);
+}
+
+static inline WORD itrp_rword(WORD addr) {
+    if (!ITRP_DATA_FAST) return (WORD)MEM_RWORD(addr);
+    WORD region = addr & 0x07000000;
+    if (region == 0x05000000)
+        return *(WORD *)(vb_state->V810_VB_RAM.off + (addr & 0x0500fffc));
+    if (region == 0x07000000)
+        return *(WORD *)(V810_ROM1.off + (addr & (0x07000000 | (MAX_ROM_SIZE - 1)) & ~3));
+    return (WORD)MEM_RWORD(addr);
+}
+
+static inline void itrp_wbyte(WORD addr, WORD data) {
+    if (!ITRP_DATA_FAST) { MEM_WBYTE(addr, data); return; }
+    if ((addr & 0x07000000) == 0x05000000)
+        *(BYTE *)(vb_state->V810_VB_RAM.off + (addr & 0x0500ffff)) = data;
+    else
+        MEM_WBYTE(addr, data);
+}
+
+static inline void itrp_whword(WORD addr, WORD data) {
+    if (!ITRP_DATA_FAST) { MEM_WHWORD(addr, data); return; }
+    if ((addr & 0x07000000) == 0x05000000)
+        *(HWORD *)(vb_state->V810_VB_RAM.off + (addr & 0x0500fffe)) = data;
+    else
+        MEM_WHWORD(addr, data);
+}
+
+static inline void itrp_wword(WORD addr, WORD data) {
+    if (!ITRP_DATA_FAST) { MEM_WWORD(addr, data); return; }
+    if ((addr & 0x07000000) == 0x05000000)
+        *(WORD *)(vb_state->V810_VB_RAM.off + (addr & 0x0500fffc)) = data;
+    else
+        MEM_WWORD(addr, data);
+}
+
 static bool get_cond(BYTE code, WORD psw) {
     bool cond = false;
     switch (0x40 | (code & ~8)) {
@@ -134,6 +209,10 @@ static inline bool is_busywait_loop(WORD target_pc, WORD branch_pc) {
 int interpreter_run(void) {
     // keep PC and cycles in local variables for extra speed
     // can't do this with PSW because interrupts modify it
+    // (NOTE: localizing the PSW was tried and measured 15-58% SLOWER on
+    // device — the extra live register across this huge switch caused
+    // spills, while the M7 store buffer absorbs the PSW memory RMW almost
+    // for free. See NOTES "PSW localization experiment". Don't redo it.)
     WORD PC = vb_state->v810_state.PC;
     WORD last_PC = PC;
     WORD cycles = vb_state->v810_state.cycles;
@@ -539,7 +618,7 @@ int interpreter_run(void) {
                 case V810_OP_LD_B: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (SBYTE)MEM_RBYTE(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (SBYTE)itrp_rbyte(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 2 cycles instead of 3
                         cycles -= 1;
@@ -553,7 +632,7 @@ int interpreter_run(void) {
                 case V810_OP_LD_H: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (SHWORD)MEM_RHWORD(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (SHWORD)itrp_rhword(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 2 cycles instead of 3
                         cycles -= 1;
@@ -567,7 +646,7 @@ int interpreter_run(void) {
                 case V810_OP_LD_W: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = MEM_RWORD(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = itrp_rword(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 4 cycles instead of 5
                         cycles -= 1;
@@ -581,7 +660,7 @@ int interpreter_run(void) {
                 case V810_OP_IN_B: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (BYTE)MEM_RBYTE(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (BYTE)itrp_rbyte(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 2 cycles instead of 3
                         cycles -= 1;
@@ -595,7 +674,7 @@ int interpreter_run(void) {
                 case V810_OP_IN_H: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (HWORD)MEM_RHWORD(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (HWORD)itrp_rhword(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 2 cycles instead of 3
                         cycles -= 1;
@@ -609,7 +688,7 @@ int interpreter_run(void) {
                 case V810_OP_IN_W: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (WORD)MEM_RWORD(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (WORD)itrp_rword(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 4 cycles instead of 5
                         cycles -= 1;
@@ -625,7 +704,7 @@ int interpreter_run(void) {
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
                     BYTE reg2_val = 0;
                     if (reg2) reg2_val = vb_state->v810_state.P_REG[reg2];
-                    MEM_WBYTE(reg1_val + (SHWORD)instr2, reg2_val);
+                    itrp_wbyte(reg1_val + (SHWORD)instr2, reg2_val);
                     if ((last_opcode & 0x34) == 0x34 && (last_opcode & 3) != 2) {
                         // with two consecutive stores, the second takes 2 cycles instead of 1
                         cycles += 1;
@@ -637,7 +716,7 @@ int interpreter_run(void) {
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
                     HWORD reg2_val = 0;
                     if (reg2) reg2_val = vb_state->v810_state.P_REG[reg2];
-                    MEM_WHWORD(reg1_val + (SHWORD)instr2, reg2_val);
+                    itrp_whword(reg1_val + (SHWORD)instr2, reg2_val);
                     if ((last_opcode & 0x34) == 0x34 && (last_opcode & 3) != 2) {
                         // with two consecutive stores, the second takes 2 cycles instead of 1
                         cycles += 1;
@@ -649,7 +728,7 @@ int interpreter_run(void) {
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
                     WORD reg2_val = 0;
                     if (reg2) reg2_val = vb_state->v810_state.P_REG[reg2];
-                    MEM_WWORD(reg1_val + (SHWORD)instr2, reg2_val);
+                    itrp_wword(reg1_val + (SHWORD)instr2, reg2_val);
                     if ((last_opcode & 0x34) == 0x34 && (last_opcode & 3) != 2) {
                         // with two consecutive stores, the second takes 4 cycles instead of 1
                         cycles += 3;

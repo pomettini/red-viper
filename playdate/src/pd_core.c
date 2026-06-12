@@ -81,7 +81,10 @@ int pd_core_init(PlaydateAPI *pd) {
 }
 
 int pd_core_load_rom(PlaydateAPI *pd, const char *path) {
-    SDFile *f = pd->file->open(path, kFileRead);
+    // kFileReadData lets absolute paths in the shared data tree
+    // (/Shared/Emulation/vb/games/...) resolve; kFileRead keeps bundle-relative
+    // names working too. The picker hands us absolute /Shared paths.
+    SDFile *f = pd->file->open(path, kFileRead | kFileReadData);
     if (!f) {
         pd->system->logToConsole("pd_core_load_rom: open '%s' failed: %s",
                                  path, pd->file->geterr());

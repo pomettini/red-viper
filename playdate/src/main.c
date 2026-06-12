@@ -12,6 +12,7 @@
 #include "pd_core.h"
 #include "pd_video.h"
 #include "pd_jit_test.h"
+#include "rom_picker.h"
 
 #ifdef _WINDLL
 __declspec(dllexport)
@@ -26,7 +27,51 @@ static const char* SYSTEM_FONT_PATH =
 static LCDFont* s_font = NULL;
 static const char* s_load_err = NULL;
 
-static const char* ROM_PATH = "marios_tennis.vb";
+// ROM library lives in the shared cross-app emulation tree (CrankBoy
+// convention), scanned by pd-rom-picker. The picker creates the folder on first
+// run, so a fresh install lands the user in a known place. ROMs are .vb files.
+static const char* ROM_FOLDER = "/Shared/Emulation/vb/games/";
+static const char* ROM_EXTENSIONS[] = { "vb", NULL };
+
+// App runs in one of two modes: the ROM picker (browse/select), or the running
+// emulator. We start in the picker; selecting a ROM loads it and switches to
+// EMU. A system-menu item switches back to the picker mid-game.
+typedef enum { APP_PICKER, APP_EMU } AppMode;
+static AppMode s_mode = APP_PICKER;
+
+static void start_picker(PlaydateAPI* pd);
+
+// Fired synchronously by the picker (either auto-load-single during init, or an
+// A-press during rom_picker_update) with an absolute path under ROM_FOLDER.
+static void on_rom_picked(const char* path, void* userdata) {
+    PlaydateAPI* pd = (PlaydateAPI*)userdata;
+    int rc = pd_core_load_rom(pd, path);
+    if (rc != 0) {
+        // Stay in the picker so the user can choose another file.
+        pd->system->logToConsole("on_rom_picked: load '%s' failed rc=%d",
+                                  path, rc);
+        return;
+    }
+    s_mode = APP_EMU;
+}
+
+static void start_picker(PlaydateAPI* pd) {
+    RomPickerConfig cfg = {
+        .folder           = ROM_FOLDER,
+        .extensions       = ROM_EXTENSIONS,
+        .on_select        = on_rom_picked,
+        .userdata         = pd,
+        .auto_load_single = 1,
+    };
+    s_mode = APP_PICKER;
+    // rom_picker_init may call on_rom_picked synchronously (auto-load-single),
+    // which flips s_mode to APP_EMU — so this must run after pd_core is ready.
+    rom_picker_init(pd, &cfg);
+    // Selection already happened (auto-load-single): release the picker's
+    // file-list heap. Done here, after init returns, because the path passed
+    // to on_rom_picked points into that list.
+    if (s_mode == APP_EMU) rom_picker_free();
+}
 
 // Frame-skip "feel" mode, adjustable at runtime via the Playdate system menu
 // (the menu button, so it doesn't steal game input). The interpreter runs every
@@ -34,12 +79,20 @@ static const char* ROM_PATH = "marios_tennis.vb";
 // (VIP composite + blit) is skipped. For render-bound games this keeps the game
 // running at real speed while the screen updates less often. 0 = render every
 // frame; N = render every (N+1)th frame.
-static int s_render_skip = 0;
+static int s_render_skip = 1;
 static PDMenuItem* s_skip_item = NULL;
 
 static void skip_menu_cb(void* userdata) {
     PlaydateAPI* pd = (PlaydateAPI*)userdata;
     if (s_skip_item) s_render_skip = pd->system->getMenuItemValue(s_skip_item);
+}
+
+// "ROM Picker" system-menu item: drop back to the picker to choose another ROM
+// mid-game. The current emulation just stops being driven; picking a new ROM
+// reloads the core and resumes in EMU mode.
+static void picker_menu_cb(void* userdata) {
+    PlaydateAPI* pd = (PlaydateAPI*)userdata;
+    start_picker(pd);
 }
 
 int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
@@ -56,13 +109,6 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 
         if (pd_core_init(pd) != 0) {
             s_load_err = "pd_core_init failed";
-        } else {
-            int rc = pd_core_load_rom(pd, ROM_PATH);
-            if (rc != 0) {
-                static char buf[64];
-                snprintf(buf, sizeof(buf), "load_rom rc=%d", rc);
-                s_load_err = buf;
-            }
         }
 
         // Dynarec feasibility probe (device-only): confirm we can run
@@ -79,6 +125,16 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
         static const char* skip_opts[] = { "Off", "Skip 1", "Skip 2", "Skip 3" };
         s_skip_item = pd->system->addOptionsMenuItem(
             "Frame skip", skip_opts, 4, skip_menu_cb, pd);
+        // Default to "Skip 1" so the menu UI matches s_render_skip's initial
+        // value (addOptionsMenuItem otherwise starts the selector at "Off").
+        if (s_skip_item) pd->system->setMenuItemValue(s_skip_item, s_render_skip);
+
+        // "ROM Picker" item to switch ROMs without relaunching.
+        pd->system->addMenuItem("ROM Picker", picker_menu_cb, pd);
+
+        // Start in the ROM picker (unless pd_core_init failed). May auto-load
+        // and jump straight to EMU mode if exactly one ROM is present.
+        if (!s_load_err) start_picker(pd);
     }
 
     return 0;
@@ -122,8 +178,18 @@ static int update(void* userdata)
         char line[96];
         snprintf(line, sizeof(line), "ROM error: %s", s_load_err);
         pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 40);
-        snprintf(line, sizeof(line), "path: %s", ROM_PATH);
+        snprintf(line, sizeof(line), "folder: %s", ROM_FOLDER);
         pd->graphics->drawText(line, strlen(line), kASCIIEncoding, 8, 64);
+        return 1;
+    }
+
+    // ROM picker mode: it draws and handles input itself; on A it fires
+    // on_rom_picked, which loads the ROM and flips us to APP_EMU. Once that
+    // happens, free the picker's file-list heap (after the lib call returns —
+    // the selected path points into that list while the callback runs).
+    if (s_mode == APP_PICKER) {
+        rom_picker_update();
+        if (s_mode == APP_EMU) rom_picker_free();
         return 1;
     }
 

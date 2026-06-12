@@ -39,9 +39,10 @@ SRC = \
 	core/video_common.c \
 	core/video_soft.cpp \
 	core/patches.c \
-	core/rom_db.c
+	core/rom_db.c \
+	pd-rom-picker/src/rom_picker.c
 
-UINCDIR = src ../include
+UINCDIR = src ../include pd-rom-picker/src
 
 UASRC =
 # RV_PLAYDATE is set for both device and simulator builds (UDEFS applies to

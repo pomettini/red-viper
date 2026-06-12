@@ -4,3 +4,6 @@
 [submodule "source/3ds/yattlib-3d"]
 	path = source/3ds/yattlib-3d
 	url = https://github.com/Wyatt-James/yattlib-3d
+[submodule "playdate/pd-rom-picker"]
+	path = playdate/pd-rom-picker
+	url = https://github.com/pomettini/pd-rom-picker
