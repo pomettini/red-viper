@@ -143,6 +143,14 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
     return 0;
 }
 
+#ifdef RV_BW_STATS
+// Diagnostic build only: busywait-detector reject counters from interpreter.c.
+// Logged per window to identify undetected spin/delay loops by branch PC.
+struct rv_bw_rej_entry { uint32_t pc; uint32_t count; };
+extern struct rv_bw_rej_entry rv_bw_rej[16];
+extern uint32_t rv_evt_count, rv_int_count;
+#endif
+
 // Per-window profile accumulators. One window = LOG_INTERVAL frames; at the
 // end of each window we emit one console line summarising avg/max costs.
 // Stays out of the hot path: just integer/float adds, one snprintf+log per
@@ -257,6 +265,28 @@ static int update(void* userdata)
             (unsigned long)st->last_frame_cycles,
             (unsigned long)st->pc,
             st->xpctrl);
+#ifdef RV_BW_STATS
+        // Log the two hottest rejected backward branches this window, then
+        // clear. A huge count during a slow phase = the undetected loop.
+        {
+            int b0 = -1, b1 = -1;
+            for (int i = 0; i < 16; i++) {
+                if (!rv_bw_rej[i].count) continue;
+                if (b0 < 0 || rv_bw_rej[i].count > rv_bw_rej[b0].count) { b1 = b0; b0 = i; }
+                else if (b1 < 0 || rv_bw_rej[i].count > rv_bw_rej[b1].count) { b1 = i; }
+            }
+            if (b0 >= 0) {
+                pd->system->logToConsole("  bwrej top: %08lx n=%lu%s%08lx n=%lu | evt=%lu int=%lu",
+                    (unsigned long)rv_bw_rej[b0].pc, (unsigned long)rv_bw_rej[b0].count,
+                    b1 >= 0 ? " | " : "",
+                    b1 >= 0 ? (unsigned long)rv_bw_rej[b1].pc : 0,
+                    b1 >= 0 ? (unsigned long)rv_bw_rej[b1].count : 0,
+                    (unsigned long)rv_evt_count, (unsigned long)rv_int_count);
+            }
+            memset(rv_bw_rej, 0, sizeof(rv_bw_rej));
+            rv_evt_count = rv_int_count = 0;
+        }
+#endif
         prof_reset();
     }
 

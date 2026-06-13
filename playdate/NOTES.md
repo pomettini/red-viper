@@ -1838,10 +1838,115 @@ the per-pixel loop (one ceil-div per run, write-only inside). Implemented as a
 fast path inside render_affine_world_1bpp; rotated rows keep the generic
 per-pixel loop.
 
+(Span renderer results below; the diagnostic findings that followed are at the
+end of this addendum.)
+
 First device run (court renders correctly — no artifacts):
 - **Demo match vip 22.5 → ~18.5 (-18%)** — magnified court rows get runs of
   2+, the span win is real where it matters (gameplay).
-- **Title court vip 43.5 → 46.8 (+3.3)** — zoomed-OUT court rows are minified
-  (dx >= 0x200): every run is length 1, so the per-run SDIV + bookkeeping is
-  pure overhead. Fixed by gating the fast path to dx < 0x200 (magnified rows
-  only); minified rows stay on the generic loop. Re-measure pending.
+- **Title court vip 43.5 → 46.8 (+3.3)** — first blamed on span overhead on
+  minified rows; a dx < 0x200 gate was added, and the re-measure came back
+  **identical (46.7)** — so the title court never took the span path at all
+  (its rows are presumably dy != 0 or minified either way), and the +3 is the
+  **layout lottery** yet again, triggered by inserting the span code. The gate
+  stays (it's correct in principle for minified affine scenes elsewhere), but
+  the attribution is corrected.
+- Verified in a 4-player demo too: vip ~23-25 → ~21.5, int consistent with
+  prior 4P runs (~37) — win holds, no regression.
+
+## ADDENDUM (2026-06-04): the bwrej/event diagnostic — three mysteries solved
+
+A diagnostic build (-DRV_BW_STATS=1) logs, per window: the two hottest taken
+backward ROM branches the busywait detector REJECTED (pc+count), serviceInt
+event checks (evt=), and interrupts taken (int=). One Wario + one Pinball
+session answered three open questions:
+
+1. **Galactic Pinball's "random slowdowns" = INTERRUPT STORM.** Calm table:
+   ~68 evt + 4 interrupts/frame. Stalls: ~1000 evt + **~370-400 interrupts
+   per frame** (sound engine driving the hardware timer at audio rate), each
+   costing ~165 us of emulator time (serviceInt/serviceDisplayInt/predictEvent
+   chain + interpreter exit/re-entry + ISR instructions on slow-path HW regs)
+   → 100-128 ms frames. Authentic game behavior amplified by per-interrupt
+   overhead. *Lever if ever pursued:* trim the per-interrupt path (avoid full
+   interpreter exit/re-entry on taken interrupts; cache predictEvent's
+   divisions; fast-path the ISR's HW-reg access pattern). Bounded payoff: the
+   ISR's own work remains.
+2. **Wario Land's transition freezes (130-260 ms spikes) = REAL WORK.** The
+   hot rejected loop (fffc36fe, up to 140k iter/window) is a 92-byte
+   decompression/copy loop at level loads. Not skippable. This also buried the
+   countdown-loop fast-forward idea: every hot rejected loop found today is
+   real work or side-effecting I/O, not a pure delay.
+3. **Wario steady-state demo REGRESSED ~25-30% vs expected** (user noticed by
+   feel first): now ~50-54 int (incl. ~5-10% diag overhead) vs ~40-45 recorded
+   PRE-fast-path, when the fast path should have landed it at ~33-38.
+   (Initially suspected layout; resolved below — it was the fast path itself.)
+
+## ADDENDUM (2026-06-13): per-game CPU fast path — the Wario regression resolved
+
+Single-toggle A/B (RV_NO_DATA_FASTPATH) attributed Wario's regression to the
+**data fast path itself**: demo level 1 int 54.0 with it, **46.5 without** —
+a consistent ~15% penalty across all Wario phases. Diagnostic overhead was nil
+(53.9 diag vs 54.0 production).
+
+Step 1 — **noinline helpers**: un-inlined the six itrp_* helpers (~400 B
+outlined vs inline copies at 9 sites). Result: **Tennis demo int 23.5 — best
+ever recorded** (was 25.5-29 inline, ~40 without fast path); Wario only
+recovered to 51.7. Conclusion: Wario's cost is not loop footprint but that
+ANY per-access helper code in SDRAM pays I-cache eviction tax in a thrashing
+game — each evicted line is a ~265-cycle SDRAM burst. The fastpath-off route
+runs through the DTCM-relocated stubs (pd_itcm.c), and **TCM code never
+misses** — same conclusion as the user's vecx Playdate ITCM guide
+(pomettini/vecx PLAYDATE_ITCM_GUIDE.md, +13-15% FPS from relocating the hot
+opcode core; also documents the loader-relocation pitfall and the ~4-5 KB
+usable DTCM pool — our pd_itcm uses 448 B of it, real headroom remains).
+
+Step 2 — **runtime per-game selector** (`rv_cpu_fastpath`, set in
+pd_core_load_rom by GAME_ID): ON by default (direct-call SDRAM helpers,
+Tennis-class winner); OFF for I-cache-thrashing games where the indirect
+DTCM-stub path wins — currently just Wario Land (gid 901ade10). Cost of the
+runtime check: one predictable compare per access (~negligible). The two
+configs are now both available per game instead of a global compromise.
+
+There is no single best memory-access path on this hardware: cache-resident
+games want minimum instructions (direct call, inline checks); cache-thrashing
+games want minimum SDRAM code touched per access (indirect call into TCM).
+The per-game flag is the honest answer.
+
+**Implementation history (each step device-measured):**
+1. Runtime flag INSIDE the helpers: Wario 68 ms — FAILED. Reading the flag
+   touched an SDRAM helper line per access, the exact tax off-mode must avoid.
+2. Function-pointer routing at the call sites (rv_data_*, retargeted per frame
+   after rv_itcm_relocate; u64→WORD pointer cast is AAPCS-sound for the low
+   word): Tennis 2P demo 22.5 int (best ever, indirect-call cost ≈ noise),
+   title court vip 41.3 (best ever, beating even the pre-picker 43.7 —
+   refunding the "span layout debt"). Wario: 57.7.
+
+**Closing verdict on Wario-class games:** the pointer-routed off-mode executes
+a near-identical instruction sequence to the compile-time-off config (46.5)
+yet measured 57.7 — equivalent builds 24% apart. For games whose working set
+thrashes the I-cache, **build-to-build layout noise (±11 ms) exceeds any
+source-level mode choice (±5 ms)**. The per-game flag stays (correct, free,
+right for the games where modes DO differ), but Wario's number lives wherever
+each build's layout lottery puts it, roughly the 46-68 band. The only
+deterministic fix is full hot-core relocation into TCM (vecx-style: compact
+hot interpreter core in the ~4-5 KB DTCM pool, cold fallback in SDRAM) — a
+future-session-sized rebuild of interpreter_run, with the recipe already
+proven in pomettini/vecx's PLAYDATE_ITCM_GUIDE.md (+13-15% there).
+
+**Where the optimization saga ends (2026-06-13):**
+- Mario's Tennis: title court tot 77→63 ms, 2P gameplay ~60→~42 ms (≈13→24
+  fps before frameskip). Stable across builds (cache-resident = lottery-immune).
+- Wario Land: layout-dominated, 46-68 ms band, mode flag in place for when it
+  helps. Honest status: not deterministically improvable without TCM hot-core.
+- Structural wins survive; layout effects are weather; every claim above has
+  an A/B behind it.
+
+**Final optimization-arc tally (Mario's Tennis, gameplay = what matters):**
+2-player match frame ~60 ms → **~45 ms** (≈13 → ≈22 fps before frameskip),
+from two structural changes: interpreter load/store fast path (int ~35→~26)
+and affine span rendering (vip ~22.5→~18.5). 4P matches ~65→~60. The title
+screen carries a ~3 ms layout debt (cosmetic phase; layout-owned, not worth
+more probes). Failed-and-reverted along the way, all documented above: falign,
+hot-section pinning, PSW localization — plus two attribution corrections
+(player-count confound, span-overhead misread). Structural wins survive layout
+reshuffles; everything else on this chip is weather.

@@ -19,6 +19,16 @@
 
 extern void apply_patches(void);
 
+// Per-game data-access routing, defined in interpreter.c: fast mode = direct
+// calls to the SDRAM fast helpers, slow mode = the same DTCM-relocated stubs as
+// g_rv_*. Selected per GAME_ID in pd_core_load_rom, applied each frame in
+// pd_core_run_frame (after rv_itcm_relocate refreshes the stub addresses).
+typedef WORD (*rv_dread_fn)(WORD);
+typedef void (*rv_dwrite_fn)(WORD, WORD);
+extern rv_dread_fn  rv_data_rbyte, rv_data_rhword, rv_data_rword;
+extern rv_dwrite_fn rv_data_wbyte, rv_data_whword, rv_data_wword;
+extern bool rv_cpu_fastpath;
+
 // Map current Playdate button state to a VB input HWORD and write it into
 // tHReg.SLB / tHReg.SHB so the next v810_run sees it. The 0x0002 bit is the
 // "controller ID present" sentinel the VB always sees from a connected pad.
@@ -130,6 +140,16 @@ int pd_core_load_rom(PlaydateAPI *pd, const char *path) {
     tVBOpt.GAME_ID = MAKE_GAMEID((char*)(V810_ROM1.off + (V810_ROM1.highaddr & 0xFFFFFDF9)));
 
     apply_patches();
+
+    // Per-game CPU data-access mode (see interpreter.c rv_cpu_fastpath).
+    // Default ON: direct-call WRAM/ROM fast helpers (best for most games —
+    // Tennis demo ~23 ms int). OFF for games that thrash the I-cache so hard
+    // that per-access helper code in SDRAM pays eviction tax on every call;
+    // for those the indirect DTCM-stub path wins.
+    rv_cpu_fastpath = (tVBOpt.GAME_ID != 0x901ade10u);  // Wario Land
+    pd->system->logToConsole("pd_core_load_rom: cpu fastpath=%d",
+                             rv_cpu_fastpath ? 1 : 0);
+
     v810_reset();
 
     s_status.loaded = true;
@@ -167,6 +187,21 @@ void pd_core_run_frame(PlaydateAPI *pd) {
         s_itcm_logged = 1;
         pd->system->logToConsole("pd_itcm: relocate=%d (region=%u bytes, buf=%u)",
                                  relocated, (unsigned)rv_itcm_size(), (unsigned)sizeof(itcm_buf));
+    }
+
+    // Apply the per-game data-access routing (interpreter.c rv_data_*). Must
+    // run AFTER rv_itcm_relocate: in slow mode the targets are the g_rv_*
+    // values, which the relocate just repointed into this frame's DTCM buffer.
+    // The read accessors return uint64 (wait bits in the high word); the
+    // interpreter only uses the low word, which AAPCS delivers in r0 under
+    // either signature, so the cast is sound.
+    if (!rv_cpu_fastpath) {
+        rv_data_rbyte  = (rv_dread_fn)g_rv_rbyte;
+        rv_data_rhword = (rv_dread_fn)g_rv_rhword;
+        rv_data_rword  = (rv_dread_fn)g_rv_rword;
+        rv_data_wbyte  = (rv_dwrite_fn)g_rv_wbyte;
+        rv_data_whword = (rv_dwrite_fn)g_rv_whword;
+        rv_data_wword  = (rv_dwrite_fn)g_rv_wword;
     }
 
     uint32_t start_cycles = vb_state->v810_state.cycles;

@@ -52,16 +52,29 @@ static inline HWORD itrp_fetch(WORD PC) {
 // alignment forced by mem_whword/mem_wword before their region switch.
 //
 // RV_NO_DATA_FASTPATH compiles the fast path out (helpers degrade to plain
-// MEM_* calls) for on-device A/B measurement: inlining 9 call sites grows the
-// interpreter loop, and on a 16 KB I-cache the footprint cost can offset the
-// indirection win in some scenes. Toggling the flag needs `make clean`.
+// MEM_* calls) for on-device A/B measurement. Toggling the flag needs
+// `make clean`.
+//
+// The helpers are deliberately NOINLINE: fully inlining them at all 9 call
+// sites (~4 KB) was measured ~25% faster on Mario's Tennis but ~15% SLOWER
+// on Wario Land — the loop outgrew what the 16 KB I-cache could keep resident
+// for the most cache-pressed game. As small outlined functions the call is a
+// cheap direct `bl` and the bodies stay hot in a few cache lines.
 #ifdef RV_NO_DATA_FASTPATH
 #define ITRP_DATA_FAST 0
 #else
 #define ITRP_DATA_FAST 1
 #endif
 
-static inline WORD itrp_rbyte(WORD addr) {
+// Per-game CPU data-access mode, set at ROM load (see pd_core_load_rom). ON
+// (default): the call sites go through the itrp_* helpers below (direct SDRAM
+// code, minimum instructions — best for cache-resident games like Tennis).
+// OFF: the rv_data_* pointers are repointed at the DTCM-relocated stubs so an
+// I-cache-thrashing game executes no per-access SDRAM helper code. Read at the
+// call sites via the rv_data_* function pointers below.
+bool rv_cpu_fastpath = true;
+
+static __attribute__((noinline)) WORD itrp_rbyte(WORD addr) {
     if (!ITRP_DATA_FAST) return (WORD)MEM_RBYTE(addr);
     WORD region = addr & 0x07000000;
     if (region == 0x05000000)
@@ -71,7 +84,7 @@ static inline WORD itrp_rbyte(WORD addr) {
     return (WORD)MEM_RBYTE(addr);
 }
 
-static inline WORD itrp_rhword(WORD addr) {
+static __attribute__((noinline)) WORD itrp_rhword(WORD addr) {
     if (!ITRP_DATA_FAST) return (WORD)MEM_RHWORD(addr);
     WORD region = addr & 0x07000000;
     if (region == 0x05000000)
@@ -81,7 +94,7 @@ static inline WORD itrp_rhword(WORD addr) {
     return (WORD)MEM_RHWORD(addr);
 }
 
-static inline WORD itrp_rword(WORD addr) {
+static __attribute__((noinline)) WORD itrp_rword(WORD addr) {
     if (!ITRP_DATA_FAST) return (WORD)MEM_RWORD(addr);
     WORD region = addr & 0x07000000;
     if (region == 0x05000000)
@@ -91,7 +104,7 @@ static inline WORD itrp_rword(WORD addr) {
     return (WORD)MEM_RWORD(addr);
 }
 
-static inline void itrp_wbyte(WORD addr, WORD data) {
+static __attribute__((noinline)) void itrp_wbyte(WORD addr, WORD data) {
     if (!ITRP_DATA_FAST) { MEM_WBYTE(addr, data); return; }
     if ((addr & 0x07000000) == 0x05000000)
         *(BYTE *)(vb_state->V810_VB_RAM.off + (addr & 0x0500ffff)) = data;
@@ -99,7 +112,7 @@ static inline void itrp_wbyte(WORD addr, WORD data) {
         MEM_WBYTE(addr, data);
 }
 
-static inline void itrp_whword(WORD addr, WORD data) {
+static __attribute__((noinline)) void itrp_whword(WORD addr, WORD data) {
     if (!ITRP_DATA_FAST) { MEM_WHWORD(addr, data); return; }
     if ((addr & 0x07000000) == 0x05000000)
         *(HWORD *)(vb_state->V810_VB_RAM.off + (addr & 0x0500fffe)) = data;
@@ -107,13 +120,32 @@ static inline void itrp_whword(WORD addr, WORD data) {
         MEM_WHWORD(addr, data);
 }
 
-static inline void itrp_wword(WORD addr, WORD data) {
+static __attribute__((noinline)) void itrp_wword(WORD addr, WORD data) {
     if (!ITRP_DATA_FAST) { MEM_WWORD(addr, data); return; }
     if ((addr & 0x07000000) == 0x05000000)
         *(WORD *)(vb_state->V810_VB_RAM.off + (addr & 0x0500fffc)) = data;
     else
         MEM_WWORD(addr, data);
 }
+
+// Per-game data-access routing, retargeted by the frontend each frame (see
+// pd_core_run_frame). Fast mode (default): point at the itrp_* helpers above
+// (direct SDRAM code, fewest instructions — best for cache-resident games).
+// Slow mode: point at the SAME targets as the g_rv_* accessors (the
+// DTCM-relocated stubs), so an I-cache-thrashing game executes zero per-access
+// SDRAM helper code. Read pointers may be retargeted at the uint64-returning
+// accessors: under AAPCS the low word arrives in r0 either way, which is the
+// only part the interpreter uses. (A runtime-flag check INSIDE the helpers was
+// tried first and cost +21 ms — the flag read itself touched an SDRAM helper
+// line per access. Routing at the call sites avoids that.)
+typedef WORD (*rv_dread_fn)(WORD);
+typedef void (*rv_dwrite_fn)(WORD, WORD);
+rv_dread_fn  rv_data_rbyte  = itrp_rbyte;
+rv_dread_fn  rv_data_rhword = itrp_rhword;
+rv_dread_fn  rv_data_rword  = itrp_rword;
+rv_dwrite_fn rv_data_wbyte  = itrp_wbyte;
+rv_dwrite_fn rv_data_whword = itrp_whword;
+rv_dwrite_fn rv_data_wword  = itrp_wword;
 
 static bool get_cond(BYTE code, WORD psw) {
     bool cond = false;
@@ -197,6 +229,19 @@ static bool busywait_body_ok(WORD target_pc, WORD branch_pc) {
 #define BW_CACHE_SIZE 256
 static struct { WORD branch_pc; bool busy; } bw_cache[BW_CACHE_SIZE];
 
+#ifdef RV_BW_STATS
+// Diagnostic (build with -DRV_BW_STATS=1, needs `make clean`): count taken
+// backward ROM branches the busywait detector REJECTED, keyed by branch PC.
+// The hottest entry during a slow phase is the undetected spin/delay loop.
+// Read+cleared by the frontend each log window. Not for shipping builds —
+// this bumps a counter on every taken backward branch.
+struct rv_bw_rej_entry { WORD pc; uint32_t count; };
+struct rv_bw_rej_entry rv_bw_rej[16];
+// Event-boundary serviceInt calls / interrupts actually taken (interpreter
+// exits). Distinguishes "interrupt storm" stalls from slow-loop stalls.
+uint32_t rv_evt_count, rv_int_count;
+#endif
+
 static inline bool is_busywait_loop(WORD target_pc, WORD branch_pc) {
     unsigned idx = (branch_pc >> 1) & (BW_CACHE_SIZE - 1);
     if (bw_cache[idx].branch_pc == branch_pc) return bw_cache[idx].busy;
@@ -221,10 +266,16 @@ int interpreter_run(void) {
     do {
         if ((SWORD)(target - cycles) <= 0) {
             vb_state->v810_state.PC = PC;
+#ifdef RV_BW_STATS
+            rv_evt_count++;
+#endif
             if (serviceInt(cycles, PC) && (PC != vb_state->v810_state.PC || vb_state->v810_state.ret)) {
                 // interrupt triggered, so we exit
                 // PC may have been modified so don't reset it
                 vb_state->v810_state.cycles = cycles;
+#ifdef RV_BW_STATS
+                rv_int_count++;
+#endif
                 return 0;
             }
             target = cycles + vb_state->v810_state.cycles_until_event_partial;
@@ -531,6 +582,17 @@ int interpreter_run(void) {
                 // holds the branch target.
                 // (Gate RV_NO_BUSYWAIT lets us A/B the detector for game-compat
                 // debugging without removing it.)
+#ifdef RV_BW_STATS
+                if (disp <= 0 && (last_PC & 0x07000000) == 0x07000000
+                    && !is_busywait_loop(PC, last_PC)) {
+                    unsigned bi = (last_PC >> 1) & 15;
+                    if (rv_bw_rej[bi].pc != last_PC) {
+                        rv_bw_rej[bi].pc = last_PC;
+                        rv_bw_rej[bi].count = 0;
+                    }
+                    rv_bw_rej[bi].count++;
+                }
+#endif
 #ifndef RV_NO_BUSYWAIT
                 if (disp <= 0
                     && (last_PC & 0x07000000) == 0x07000000
@@ -618,7 +680,7 @@ int interpreter_run(void) {
                 case V810_OP_LD_B: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (SBYTE)itrp_rbyte(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (SBYTE)rv_data_rbyte(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 2 cycles instead of 3
                         cycles -= 1;
@@ -632,7 +694,7 @@ int interpreter_run(void) {
                 case V810_OP_LD_H: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (SHWORD)itrp_rhword(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (SHWORD)rv_data_rhword(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 2 cycles instead of 3
                         cycles -= 1;
@@ -646,7 +708,7 @@ int interpreter_run(void) {
                 case V810_OP_LD_W: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = itrp_rword(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = rv_data_rword(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 4 cycles instead of 5
                         cycles -= 1;
@@ -660,7 +722,7 @@ int interpreter_run(void) {
                 case V810_OP_IN_B: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (BYTE)itrp_rbyte(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (BYTE)rv_data_rbyte(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 2 cycles instead of 3
                         cycles -= 1;
@@ -674,7 +736,7 @@ int interpreter_run(void) {
                 case V810_OP_IN_H: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (HWORD)itrp_rhword(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (HWORD)rv_data_rhword(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 2 cycles instead of 3
                         cycles -= 1;
@@ -688,7 +750,7 @@ int interpreter_run(void) {
                 case V810_OP_IN_W: {
                     WORD reg1_val = 0;
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
-                    vb_state->v810_state.P_REG[reg2] = (WORD)itrp_rword(reg1_val + (SHWORD)instr2);
+                    vb_state->v810_state.P_REG[reg2] = (WORD)rv_data_rword(reg1_val + (SHWORD)instr2);
                     if ((last_opcode & 0x34) == 0x30 && (last_opcode & 3) != 2) {
                     // load immediately following another load takes 4 cycles instead of 5
                         cycles -= 1;
@@ -704,7 +766,7 @@ int interpreter_run(void) {
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
                     BYTE reg2_val = 0;
                     if (reg2) reg2_val = vb_state->v810_state.P_REG[reg2];
-                    itrp_wbyte(reg1_val + (SHWORD)instr2, reg2_val);
+                    rv_data_wbyte(reg1_val + (SHWORD)instr2, reg2_val);
                     if ((last_opcode & 0x34) == 0x34 && (last_opcode & 3) != 2) {
                         // with two consecutive stores, the second takes 2 cycles instead of 1
                         cycles += 1;
@@ -716,7 +778,7 @@ int interpreter_run(void) {
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
                     HWORD reg2_val = 0;
                     if (reg2) reg2_val = vb_state->v810_state.P_REG[reg2];
-                    itrp_whword(reg1_val + (SHWORD)instr2, reg2_val);
+                    rv_data_whword(reg1_val + (SHWORD)instr2, reg2_val);
                     if ((last_opcode & 0x34) == 0x34 && (last_opcode & 3) != 2) {
                         // with two consecutive stores, the second takes 2 cycles instead of 1
                         cycles += 1;
@@ -728,7 +790,7 @@ int interpreter_run(void) {
                     if (reg1) reg1_val = vb_state->v810_state.P_REG[reg1];
                     WORD reg2_val = 0;
                     if (reg2) reg2_val = vb_state->v810_state.P_REG[reg2];
-                    itrp_wword(reg1_val + (SHWORD)instr2, reg2_val);
+                    rv_data_wword(reg1_val + (SHWORD)instr2, reg2_val);
                     if ((last_opcode & 0x34) == 0x34 && (last_opcode & 3) != 2) {
                         // with two consecutive stores, the second takes 4 cycles instead of 1
                         cycles += 3;
