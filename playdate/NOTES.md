@@ -1950,3 +1950,54 @@ more probes). Failed-and-reverted along the way, all documented above: falign,
 hot-section pinning, PSW localization — plus two attribution corrections
 (player-count confound, span-overhead misread). Structural wins survive layout
 reshuffles; everything else on this chip is weather.
+
+---
+
+# FORWARD-LOOKING: the per-game flag, the layout lottery, and the TCM move
+
+Written as a hand-off. The previous commit ("Per-game CPU data-access fast
+path") preserves the per-game pointer-routing scaffolding. This section records
+what was learned *after* building it, so the next session knows whether to keep
+building on it. (The commit's own NOTES describe the flag as the shipped state;
+the findings below supersede that.)
+
+**The per-game flag is NOT a win as it stands.** Measured, on device:
+- Wario steady-state `int`: global-noinline fast path = **51.7**; per-game flag
+  routing Wario to the "slow"/DTCM path = **57.7**. The flag made Wario SLOWER
+  than just leaving the fast path on for everyone.
+- The premise that "Wario wants the slow path" came from a single **46.5** ms
+  reading of that path — which turned out to be a layout-lucky outlier. The
+  pointer-routed re-implementation of the same logical path measured 57.7.
+- Tennis was equally fast either way (~22 2P). So the flag added code and a
+  per-frame branch and bought nothing positive.
+
+**Best *reproducible* both-games config = global-noinline fast path, no flag.**
+itrp_* helpers called directly at the 9 sites; no rv_cpu_fastpath, no rv_data_*
+pointers, no pd_core routing. (That is the build that was on `master` for a
+moment under Opus before being un-committed in favour of preserving the
+scaffolding here. To get back to it: drop rv_cpu_fastpath + the rv_data_*
+block, repoint the 9 call sites itrp_*, and delete the pd_core selection +
+per-frame routing blocks.)
+
+**The layout lottery is variance you eliminate, not a slot machine you beat.**
+- Wario steady swings ~46-68 ms and Tennis title court ~41-49 ms purely from
+  link-order code/data placement; the record-lows of each were lucky rolls from
+  *different* builds that never coexisted.
+- Can't aim it: the good roll is per-game (a layout that de-conflicts Wario
+  mis-places Tennis), partial code-pinning backfired (moves conflicts, doesn't
+  remove them), the big data buffers exceed the 16 KB cache so can't be
+  hand-placed out of conflict, and the M7 cache counters HARD-FAULT on Playdate
+  firmware (per vecx guide) so any tuning is a blind multi-minute-per-run search.
+- A clean rebuild is deterministic, so "rebuild until lucky" needs active layout
+  perturbation and a frozen binary — brittle, per-game, release-only.
+
+**The one real lever left = TCM hot-core relocation (vecx recipe).** Relocate
+the hot interpreter loop (+ accessors) into the cache-less DTCM pool. This
+removes Wario's I-cache pressure (so the fast path stops penalising it →
+toward 46 and *held*), eliminates the layout lottery (TCM addresses are
+deterministic), keeps Tennis's ~22, and is robust across games. pd_itcm.c
+already relocates the *accessors* (448 B of the ~4-5 KB pool); what's missing
+is the *loop itself*. Scope: rebuild interpreter_run as a ≤4 KB hot core with
+SDRAM cold fallback; verify on Wario first, then Tennis for no-regression.
+Recipe + pitfalls (loader-relocation gotcha, manual uint32 copy, -mlong-calls,
+DTCM firmware holes) in pomettini/vecx PLAYDATE_ITCM_GUIDE.md.
