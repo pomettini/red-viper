@@ -1936,8 +1936,9 @@ proven in pomettini/vecx's PLAYDATE_ITCM_GUIDE.md (+13-15% there).
 **Where the optimization saga ends (2026-06-13):**
 - Mario's Tennis: title court tot 77→63 ms, 2P gameplay ~60→~42 ms (≈13→24
   fps before frameskip). Stable across builds (cache-resident = lottery-immune).
-- Wario Land: layout-dominated, 46-68 ms band, mode flag in place for when it
-  helps. Honest status: not deterministically improvable without TCM hot-core.
+- Wario Land: layout-dominated, 46-68 ms band; shipped on the global-noinline
+  fast path (the per-game flag measured worse — see the forward-looking section
+  below). Honest status: not deterministically improvable without TCM hot-core.
 - Structural wins survive; layout effects are weather; every claim above has
   an A/B behind it.
 
